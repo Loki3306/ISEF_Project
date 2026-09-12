@@ -32,9 +32,8 @@ def evaluate_predictions(preds: list[np.ndarray], targets: list[np.ndarray], dis
     return correct / total if total > 0 else 0.0
 
 def run_subject_forensics():
-    print("Loading audio mapping...")
-    with open(REPO_ROOT / "scripts" / "verify_baseline" / "data" / "audio_mapping.json") as f:
-        audio_mapping = json.load(f)
+    # The label mapping for DTU dataset (1 -> Male/Stream A, 2 -> Female/Stream B)
+    label_mapping = {1: "A", 2: "B"}
 
     print("Loading all examples...")
     all_examples = load_all_examples()
@@ -100,17 +99,17 @@ def run_subject_forensics():
             test_ex = [examples[i] for i in test_idx]
             
             f_mean, f_std = feature_statistics(train_ex, channel_ids=None)
-            w = fit_ridge(train_ex, audio_mapping, feature_mean=f_mean, feature_std=f_std)
+            w = fit_ridge(train_ex, label_mapping, feature_mean=f_mean, feature_std=f_std)
             
             preds = []
             targets = []
             distractors = []
             for ex in test_ex:
                 p = predict_envelope(ex.eeg, w, feature_mean=f_mean, feature_std=f_std)
-                t = target_envelope(ex, audio_mapping)
-                d_stream = "B" if attended_stream_from_label(ex.label, audio_mapping) == "A" else "A"
+                t = target_envelope(ex, label_mapping)
+                d_stream = "B" if attended_stream_from_label(ex.label, label_mapping) == "A" else "A"
                 d_ex = TrialExample(ex.subject, ex.trial_index, ex.eeg, ex.wav_a, ex.wav_b, 1 if d_stream == "A" else 2)
-                d = target_envelope(d_ex, audio_mapping)
+                d = target_envelope(d_ex, label_mapping)
                 preds.append(p)
                 targets.append(t)
                 distractors.append(d)
@@ -122,7 +121,7 @@ def run_subject_forensics():
         
         # Full subject model (for transfer matrix and similarity)
         full_f_mean, full_f_std = feature_statistics(examples, channel_ids=None)
-        full_w = fit_ridge(examples, audio_mapping, feature_mean=full_f_mean, feature_std=full_f_std)
+        full_w = fit_ridge(examples, label_mapping, feature_mean=full_f_mean, feature_std=full_f_std)
         subject_models[s] = (full_w, full_f_mean, full_f_std)
         
         results["metrics"][s] = {
@@ -137,17 +136,17 @@ def run_subject_forensics():
         test_ex = subject_examples[s]
         
         f_mean, f_std = feature_statistics(train_ex, channel_ids=None)
-        w = fit_ridge(train_ex, audio_mapping, feature_mean=f_mean, feature_std=f_std)
+        w = fit_ridge(train_ex, label_mapping, feature_mean=f_mean, feature_std=f_std)
         
         preds = []
         targets = []
         distractors = []
         for ex in test_ex:
             p = predict_envelope(ex.eeg, w, feature_mean=f_mean, feature_std=f_std)
-            t = target_envelope(ex, audio_mapping)
-            d_stream = "B" if attended_stream_from_label(ex.label, audio_mapping) == "A" else "A"
+            t = target_envelope(ex, label_mapping)
+            d_stream = "B" if attended_stream_from_label(ex.label, label_mapping) == "A" else "A"
             d_ex = TrialExample(ex.subject, ex.trial_index, ex.eeg, ex.wav_a, ex.wav_b, 1 if d_stream == "A" else 2)
-            d = target_envelope(d_ex, audio_mapping)
+            d = target_envelope(d_ex, label_mapping)
             preds.append(p)
             targets.append(t)
             distractors.append(d)
@@ -174,10 +173,10 @@ def run_subject_forensics():
             distractors = []
             for ex in test_ex:
                 p = predict_envelope(ex.eeg, w_train, feature_mean=mean_train, feature_std=std_train)
-                t = target_envelope(ex, audio_mapping)
-                d_stream = "B" if attended_stream_from_label(ex.label, audio_mapping) == "A" else "A"
+                t = target_envelope(ex, label_mapping)
+                d_stream = "B" if attended_stream_from_label(ex.label, label_mapping) == "A" else "A"
                 d_ex = TrialExample(ex.subject, ex.trial_index, ex.eeg, ex.wav_a, ex.wav_b, 1 if d_stream == "A" else 2)
-                d = target_envelope(d_ex, audio_mapping)
+                d = target_envelope(d_ex, label_mapping)
                 preds.append(p)
                 targets.append(t)
                 distractors.append(d)
