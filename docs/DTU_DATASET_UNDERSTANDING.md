@@ -160,3 +160,32 @@ RAW EEG (.mat)                   RAW AUDIO (.wav)
 
 ## 7. Open Questions
 - None for Block 1. Block 1 is now rigorously defined and frozen for the first set of architecture experiments.
+
+
+# Block 2 — EEG Temporal Feature Extraction
+
+## 1. Temporal Information in 1-Second (64-Sample) Window
+- **VERIFIED FROM PROJECT/DATA**: The input is 64 samples (1.0 seconds) at 64 Hz, strictly bandpass filtered at 1–6 Hz.
+- **INFERENCE (Physics/Signal Processing)**: A 1 Hz wave has a period of 64 samples (1000 ms). A 6 Hz wave has a period of ~10.7 samples (~167 ms). Because the signal is bounded at 1-6 Hz, it contains NO high-frequency transients. The signal is highly smoothed. Any kernel smaller than 10 samples cannot capture a full oscillation of even the highest frequency in the band.
+
+## 2. Evaluation of Candidate Kernels (at 64 Hz)
+- **k = 3 (46.9 ms)**: Captures local gradients/slopes. Sub-cycle for 1-6 Hz. (INFERENCE)
+- **k = 7 (109.4 ms)**: Sub-cycle for 1-6 Hz. Captures half-waves. (INFERENCE)
+- **k = 15 (234.4 ms)**: Captures at least one full cycle of the 6 Hz upper bound. Good mid-range feature extractor. (INFERENCE)
+- **k = 31 (484.4 ms)**: Captures nearly 50% of the entire 1-second window. (VERIFIED FROM PROJECT/DATA)
+  - **Failure Mode**: If padded (e.g. `padding="same"`), it requires 15 zeros on each side, meaning ~47% of the edges are synthetic padding, causing massive edge artifacts. If unpadded, the sequence shrinks from 64 to 34, destroying temporal resolution for later fusion blocks. (INFERENCE)
+
+## 3. Evaluation of the Proposed MSCA Branches (k=3, 7, 15, 31)
+- **ARCHITECTURAL HYPOTHESIS / VERDICT**: The MSCA proposal of four parallel branches is drastically over-parameterized for a 1-6 Hz, 64-sample signal. The k=31 branch is too large and will cause severe edge artifacts or resolution loss. Furthermore, 4 parallel dense convolutions will likely overfit the limited 18-subject DTU dataset. We reject the 4-branch k=31 proposal for Block 2.
+
+## 4. Architectural Candidates
+- **A) Single dense temporal convolution**: Parameter heavy ($C_{in} \times C_{out} \times K$).
+- **B) Depthwise temporal convolution**: Applies filters per-channel independently. Massive parameter reduction ($C \times K$). Highly appropriate for small datasets (used effectively in EEGNet). (INFERENCE)
+- **C) Two-scale depthwise convolution (e.g., k=7, k=15)**: Captures sub-cycle gradients and full-cycle 6Hz oscillations without catastrophic edge effects.
+
+## 5. Temporal Downsampling
+- **DECISION**: Do not downsample/stride in the temporal encoder. We only have 64 samples. We need to preserve temporal resolution for alignment with the audio envelope later. (ARCHITECTURAL HYPOTHESIS)
+
+## 6. Recommended Temporal Block
+- **RECOMMENDATION**: A single Depthwise Temporal Convolution (k=15) OR a Two-Scale Depthwise Convolution (k=7, k=15).
+- **Why**: Depthwise convolution strictly controls parameter count to prevent overfitting the 18 subjects. k=15 (234ms) is perfectly sized to capture the 6 Hz cycles (167ms) without crossing the 50% window threshold that causes catastrophic padding artifacts. It is the absolute smallest, most interpretable mechanism to extract temporal morphology before moving to spatial blocks.
