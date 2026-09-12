@@ -61,6 +61,11 @@ class ContrastiveMatchNet(nn.Module):
             self.eeg_encoder = EEGNetS1(in_channels=eeg_channels)
             # Override the final projection
             self.eeg_encoder.output_proj = nn.Conv1d(16, latent_dim, kernel_size=1)
+        elif eeg_model_type.lower() == "eegnet_s2":
+            from models.eegnet_s2 import EEGNetS2
+            self.eeg_encoder = EEGNetS2(in_channels=eeg_channels)
+            # Override the final projection
+            self.eeg_encoder.output_proj = nn.Conv1d(16, latent_dim, kernel_size=1)
         else:
             raise ValueError(f"Unknown eeg_model_type: {eeg_model_type}")
             
