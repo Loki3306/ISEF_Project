@@ -42,9 +42,18 @@ def run_subject_forensics():
     # E0 Canonical Montage
     channel_ids = [13, 46, 43, 23, 50, 0, 52, 14]
     
-    # Subset channels
+    # Subset channels by creating new TrialExample instances (since it's frozen)
+    subset_examples = []
     for ex in all_examples:
-        ex.eeg = ex.eeg[channel_ids, :]
+        subset_examples.append(TrialExample(
+            subject=ex.subject,
+            trial_index=ex.trial_index,
+            eeg=ex.eeg[channel_ids, :],
+            wav_a=ex.wav_a,
+            wav_b=ex.wav_b,
+            label=ex.label
+        ))
+    all_examples = subset_examples
 
     # Group by subject
     subjects = sorted(list(set(ex.subject for ex in all_examples)))
