@@ -21,31 +21,36 @@ python scripts/verify_baseline/training/train_matchnet_loso.py
 ## Results (To be populated)
 | Subject Fold | 10s Window Accuracy (%) | Decisions Evaluated | E0 Baseline | Δ (E1 - E0) |
 | :--- | :--- | :--- | :--- | :--- |
-| S1 | TBD | 300 | 71.33% | TBD |
-| S2 | TBD | 300 | 66.00% | TBD |
-| S3 | TBD | 300 | 62.33% | TBD |
-| S4 | TBD | 300 | 72.00% | TBD |
-| S5 | TBD | 300 | 70.00% | TBD |
-| S6 | TBD | 300 | 49.67% | TBD |
-| S7 | TBD | 300 | 77.67% | TBD |
-| S8 | TBD | 300 | 79.67% | TBD |
-| S9 | TBD | 300 | 72.33% | TBD |
-| S10 | TBD | 300 | 69.33% | TBD |
-| S11 | TBD | 300 | 51.67% | TBD |
-| S12 | TBD | 300 | 62.33% | TBD |
-| S13 | TBD | 300 | 71.67% | TBD |
-| S14 | TBD | 300 | 76.33% | TBD |
-| S15 | TBD | 300 | 76.33% | TBD |
-| S16 | TBD | 300 | 64.67% | TBD |
-| S17 | TBD | 300 | 67.33% | TBD |
-| S18 | TBD | 300 | 66.67% | TBD |
-| **Average** | **TBD** | **5,400** | **68.19%** | **TBD** |
+| S1 | 65.67% | 300 | 71.33% | -5.66% |
+| S2 | 59.00% | 300 | 66.00% | -7.00% |
+| S3 | 50.67% | 300 | 62.33% | -11.66% |
+| S4 | 63.00% | 300 | 72.00% | -9.00% |
+| S5 | 56.00% | 300 | 70.00% | -14.00% |
+| S6 | 51.00% | 300 | 49.67% | +1.33% |
+| S7 | 53.00% | 300 | 77.67% | -24.67% |
+| S8 | 57.33% | 300 | 79.67% | -22.34% |
+| S9 | 56.67% | 300 | 72.33% | -15.66% |
+| S10 | 62.67% | 300 | 69.33% | -6.66% |
+| S11 | 54.67% | 300 | 51.67% | +3.00% |
+| S12 | 55.00% | 300 | 62.33% | -7.33% |
+| S13 | 58.67% | 300 | 71.67% | -13.00% |
+| S14 | 67.33% | 300 | 76.33% | -9.00% |
+| S15 | 69.67% | 300 | 76.33% | -6.66% |
+| S16 | 62.00% | 300 | 64.67% | -2.67% |
+| S17 | 58.33% | 300 | 67.33% | -9.00% |
+| S18 | 66.33% | 300 | 66.67% | -0.34% |
+| **Average** | **59.28%** | **5,400** | **68.19%** | **-8.91%** |
 
 ## Analysis
-TBD
+The result is a catastrophic collapse. The average LOSO accuracy fell from 68.19% to 59.28% (a -8.91% absolute degradation).
+- **Concentrated Degradation:** The degradation is most severe in the "easiest" subjects who previously drove the high baseline. For example, Subject 7 fell from 77.67% to 53.00% (-24.67%), and Subject 8 fell from 79.67% to 57.33% (-22.34%). 
+- **The Physical Constraint:** The wearable montage systematically removes the fronto-central (`FCz`, `FC6`) and central (`C5`, `C6`) electrodes, confining sensors strictly to the periphery (forehead and around the ear). Auditory evoked potentials project maximally toward the top of the head (vertex). By amputating these channels, we deprived the spatial filter of the highest-SNR signals it relied on.
+- **Artifact Vulnerability:** The peripheral electrodes in the wearable montage (`Fp1`, `Fp2`, `F7`, `F8`) are highly susceptible to ocular and muscular artifacts, which may further confuse the shallow linear spatial filters in the EEGNet encoder.
 
 ## Scientific Decision
-TBD
+**B. WEARABLE MONTAGE DEGRADES PERFORMANCE**
+The channel change causes a severe, structural performance loss. The linear spatial filter of `EEGNet` cannot compensate for the missing fronto-central dipoles when restricted to peripheral measurements.
 
 ## Recommended Next Experiment
-TBD
+We must now determine if this performance loss is an absolute physical limitation of the ear-EEG form factor, or if it is an architectural limitation of the EEGNet encoder.
+**Next Step (Block 4):** Design and evaluate a more powerful spatial architecture (e.g., self-attention, non-linear spatial mixing, or multi-scale convolutions) capable of dynamically recovering auditory correlations from the noisier, peripheral wearable electrodes without relying on strict, static linear spatial maps.
