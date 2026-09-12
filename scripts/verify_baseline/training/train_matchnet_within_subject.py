@@ -16,11 +16,12 @@ from scipy.signal import butter, filtfilt
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import KFold
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = REPO_ROOT.parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.verify_baseline.models.matchnet import ContrastiveMatchNet, contrastive_loss
-from scripts.verify_baseline.baselines.ridge_aad import load_subject_examples, subject_files
+from models.matchnet import ContrastiveMatchNet, contrastive_loss
+from baselines.ridge_aad import load_subject_examples, subject_files
 
 FS = 64
 DECISION_WINDOW_SEC = 10
@@ -49,7 +50,7 @@ def get_mapping_data():
     if map_files:
         map_file = map_files[0]
     else:
-        map_file = REPO_ROOT / "scripts" / "verify_baseline" / "data" / "audio_mapping.json"
+        map_file = REPO_ROOT / "data" / "audio_mapping.json"
         
     # 2. Find gammatone envelopes pkl
     pkl_files = list(base_dir.rglob("*gammatone*.pkl"))
@@ -59,7 +60,7 @@ def get_mapping_data():
     if pkl_files:
         env_file = pkl_files[0]
     else:
-        env_file = REPO_ROOT / "scripts" / "verify_baseline" / "data" / "gammatone_envelopes.pkl"
+        env_file = REPO_ROOT / "data" / "gammatone_envelopes.pkl"
         
     print(f"Using map file: {map_file}")
     print(f"Using env file: {env_file}")
@@ -176,7 +177,7 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
         all_paths = [p for p in all_paths if p.stem in subjects_to_run]
         
     os.makedirs(REPO_ROOT / "checkpoints", exist_ok=True)
-    os.makedirs(REPO_ROOT / "experiments", exist_ok=True)
+    os.makedirs(PROJECT_ROOT / "experiments", exist_ok=True)
     
     loso_e0_baseline = {
         "S1": 0.5833, "S10": 0.4833, "S11": 0.5500, "S12": 0.6500, 
@@ -331,7 +332,7 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
             "summary_metrics": all_subject_metrics,
             "detailed_logs": detailed_logs
         }
-        with open(REPO_ROOT / "experiments" / "matchnet_within_subject_results.json", "w") as f:
+        with open(PROJECT_ROOT / "experiments" / "matchnet_within_subject_results.json", "w") as f:
             json.dump(out_data, f, indent=4)
             
     print("\n" + "="*80)
