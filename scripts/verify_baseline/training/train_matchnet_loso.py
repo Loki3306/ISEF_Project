@@ -18,7 +18,7 @@ from torch.utils.data import TensorDataset, DataLoader
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from models.matchnet import ContrastiveMatchNet, contrastive_loss
+from models.matchnet import ContrastiveMatchNet, contrastive_loss, anchored_contrastive_loss
 from baselines.ridge_aad import load_subject_examples, subject_files, iter_leave_one_subject_out
 
 FS = 64
@@ -203,7 +203,7 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                 
     return n_correct, n_total
 
-def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None):
+def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1):
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | MatchNet ({eeg_model}) | Channels: {channels}")
@@ -329,7 +329,10 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
                 optimizer.zero_grad()
                 with torch.cuda.amp.autocast():
                     z_eeg, z_a, z_b = model(bx, bya, byb)
-                    loss, sa, sb = contrastive_loss(z_eeg, z_a, z_b, margin=0.1)
+                    if loss_type == "anchored":
+                        loss, sa, sb = anchored_contrastive_loss(z_eeg, z_a, z_b, margin=0.1, lambda_align=lambda_align, align_target=align_target)
+                    else:
+                        loss, sa, sb = contrastive_loss(z_eeg, z_a, z_b, margin=0.1)
                 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -412,6 +415,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=512, help="Training batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="Dataloader num_workers")
     parser.add_argument("--subjects", type=str, nargs='+', default=None, help="Specific subjects to run (e.g. S2_data_preproc)")
+    parser.add_argument("--loss", type=str, default="contrastive", choices=["contrastive", "anchored"], help="Loss function to use")
+    parser.add_argument("--lambda_align", type=float, default=0.5, help="Lambda for alignment penalty")
+    parser.add_argument("--align_target", type=float, default=0.1, help="Positive alignment target for anchored loss")
     args = parser.parse_args()
     
-    train_matchnet_loso(args.model, args.channels, args.lowcut, args.highcut, args.batch_size, args.num_workers, args.subjects)
+    train_matchnet_loso(args.model, args.channels, args.lowcut, args.highcut, args.batch_size, args.num_workers, args.subjects, args.loss, args.lambda_align, args.align_target)
