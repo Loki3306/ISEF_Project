@@ -311,12 +311,12 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
             detailed_logs.append({
                 "subject": subject_id,
                 "fold": fold_idx + 1,
-                "train_trial_ids": sorted(train_final_idx_list),
-                "val_trial_ids": sorted(val_idx_list),
-                "test_trial_ids": sorted(test_idx_list),
-                "best_epoch": best_epoch + 1,
-                "best_val_accuracy": best_val_acc,
-                "test_accuracy": test_acc
+                "train_trial_ids": [int(x) for x in sorted(train_final_idx_list)],
+                "val_trial_ids": [int(x) for x in sorted(val_idx_list)],
+                "test_trial_ids": [int(x) for x in sorted(test_idx_list)],
+                "best_epoch": int(best_epoch + 1),
+                "best_val_accuracy": float(best_val_acc),
+                "test_accuracy": float(test_acc)
             })
             
             # Cleanup memory per fold
