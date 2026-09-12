@@ -41,6 +41,7 @@ class DynamicElectrodeAttention(nn.Module):
         x_mixed = torch.einsum('bfct, bcd -> bfdt', x, weights)
         
         # Reshape to match downstream EEGNet expectations: [B, F1*D, 1, T]
+        B, F1, D, T = x_mixed.shape
         x_out = x_mixed.reshape(B, F1 * D, 1, T)
         
         return x_out
