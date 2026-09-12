@@ -196,6 +196,28 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
 def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2):
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Verification print block for E1
+    e0_indices = [13, 46, 43, 23, 50, 0, 52, 14]
+    e0_names = ["C5", "FCz", "FC6", "P9", "C6", "Fp1", "TP8", "T7"]
+    e1_indices = [0, 33, 6, 41, 22, 59, 15, 52]
+    e1_names = ["Fp1", "Fp2", "F7", "F8", "P7", "P8", "TP7", "TP8"]
+    
+    print("\n" + "="*50)
+    print("CHANNEL VERIFICATION")
+    print(f"E0 channel indices: {e0_indices}")
+    print(f"E0 channel names: {e0_names}")
+    print(f"E1 (Current) channel indices: {channels}")
+    
+    # Ensure this script is running E1
+    if channels == e1_indices:
+        print(f"E1 channel names: {e1_names}")
+    
+    # Print tensor shape entering MatchNet (simulated)
+    dummy_eeg = torch.randn(16, len(channels), 320)
+    print(f"Verified EEG tensor shape entering MatchNet: {list(dummy_eeg.shape)}")
+    print("="*50 + "\n")
+    
     print(f"Using device: {device} | MatchNet ({eeg_model}) | Channels: {channels}")
     
     mapping, envelopes = get_mapping_data()
@@ -418,7 +440,7 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Contrastive MatchNet")
     parser.add_argument("--model", type=str, default="eegnet", choices=["eegnet", "atcnet"], help="Base EEG encoder")
-    parser.add_argument("--channels", type=int, nargs='+', default=[13, 46, 43, 23, 50, 0, 52, 14])
+    parser.add_argument("--channels", type=int, nargs='+', default=[0, 33, 6, 41, 22, 59, 15, 52])
     parser.add_argument("--lowcut", type=float, default=1.0)
     parser.add_argument("--highcut", type=float, default=6.0)
     parser.add_argument("--batch_size", type=int, default=512, help="Training batch size")
