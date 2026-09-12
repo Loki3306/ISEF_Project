@@ -48,7 +48,7 @@ def run_subject_forensics():
         subset_examples.append(TrialExample(
             subject=ex.subject,
             trial_index=ex.trial_index,
-            eeg=ex.eeg[channel_ids, :],
+            eeg=ex.eeg[:, channel_ids],
             wav_a=ex.wav_a,
             wav_b=ex.wav_b,
             label=ex.label
