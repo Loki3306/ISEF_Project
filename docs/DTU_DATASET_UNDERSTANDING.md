@@ -162,48 +162,68 @@ RAW EEG (.mat)                   RAW AUDIO (.wav)
 - None for Block 1. Block 1 is now rigorously defined and frozen for the first set of architecture experiments.
 
 
-# Block 2 — EEG Temporal Feature Extraction
+# Block 2 — EEG Temporal Feature Extraction (Final Verification)
 
-## 1. The Existing EEGNet Baseline (VERIFIED FROM PROJECT)
-- The historical MatchNet baseline uses an EEGNet temporal encoder with a massive initial **k=64** (1.0s) temporal convolution, padded with 32 zeros on each side.
-- This is followed by a spatial depthwise convolution and a **k=16** (0.25s) depthwise separable temporal refinement.
-- **Limitation of the Baseline:** A fixed 64-sample kernel applies a very wide, fixed-resolution temporal window. While this is highly effective for long offline windows, it limits the network's ability to selectively focus on short, high-frequency morphological features (like onset slopes) independently of the broad 1-second trend. It is also structurally rigid if we intend to support ultra-low-latency short windows (e.g., 0.1s / 6 samples).
+## 1. The Existing EEGNet Baseline
+- **VERIFIED FACT:** The historical baseline uses an EEGNet temporal encoder with an initial temporal convolution of **k=64** (padded with 32 zeros on each side). This is followed by a spatial block, and then a **k=16** depthwise separable temporal refinement (padded with 8 zeros).
+- **Temporal Information Captured:** A k=64 kernel does *not* mean it cannot represent short features. Because neural networks learn arbitrary filter weights, a k=64 filter is perfectly capable of learning sharp, high-frequency wavelets (e.g., Gabor-like filters with a narrow envelope) embedded within a larger context. 
+- **Limitation to Fix:** While k=64 can theoretically learn sharp wavelets, forcing all temporal filters to span 1 second creates a rigid receptive field that may struggle to decouple ultra-local morphology from broad background oscillations dynamically. 
 
-## 2. Multi-Window Analysis & Short-Window Feasibility (ARCHITECTURAL CONSTRAINT)
-The proposed MSCA architecture must support the following evaluation windows:
-- 0.1 s → ~6 samples
-- 0.25 s → 16 samples
-- 0.5 s → 32 samples
-- 1.0 s → 64 samples
-- 2.0 s, 5.0 s, 10.0 s → >128 samples
+## 2. Multi-Scale Justification (k=3, 7, 15, 31)
+What distinct information could these branches add?
+- **k=3 (46.9 ms):** (INFERENCE) Captures immediate local slopes, first-derivatives, and micro-onset boundaries. AAD relevance: Can isolate sharp cortical responses to acoustic transients without integrating surrounding slow-wave noise.
+- **k=7 (109.4 ms):** (INFERENCE) Captures wider local curvature and half-wave morphology. AAD relevance: Represents phonemic-level cortical locking.
+- **k=15 (234.4 ms):** (INFERENCE) Captures full syllabic-rate oscillations (e.g., 4-6 Hz). AAD relevance: Matches the fundamental cortical envelope-tracking rhythm.
+- **k=31 (484.4 ms):** (INFERENCE) Captures slow delta oscillations and wider context. AAD relevance: Provides a phase-reference frame for the faster temporal scales.
+- **Is it complementary?** (HYPOTHESIS): Yes, explicit multi-scale processing forces the network to independently represent these distinct scales, whereas a single k=64 kernel might entangle them.
 
-**Behavior of MSCA Kernels (k=3, 7, 15, 31) at short windows:**
-- For a 1s window (64 samples), all kernels are fully valid local operators.
-- For a 0.25s window (16 samples), `k=31` is physically larger than the entire input sequence. A convolution would either crash or require >50% zero-padding to simply execute, turning it into a massive global padding-artifact generator rather than a local feature extractor.
-- For a 0.1s window (6 samples), `k=7, 15, 31` are all mathematically invalid as local convolutions without extreme padding.
+## 3. Parameterization (Dense vs. Depthwise)
+Assume the input is processed independently over 1 channel (as in EEGNet's first layer) or uses $C_{in}=8, C_{out}=8$.
+- **A. Existing EEGNet Temporal (k=64 + k=16):** 
+  - `Conv2d(1, 8, k=64)` = 512 params. 
+  - `Conv2d(16, 16, k=16, groups=16)` = 256 params. 
+  - Total Temporal = **768 parameters**.
+- **B. Single k=15:** 
+  - Dense ($C_{in}=8, C_{out}=8$): $8 \times 8 \times 15 = 960$. 
+  - Depthwise: $8 \times 15 = 120$.
+- **C. k=7 + k=15:** 
+  - Dense: $960 + 448 = 1,408$. 
+  - Depthwise: $120 + 56 = 176$.
+- **D. k=3 + k=7 + k=15:** 
+  - Dense: $1408 + 192 = 1,600$. 
+  - Depthwise: $176 + 24 = 200$.
+- **E. k=3 + k=7 + k=15 + k=31:** 
+  - Dense: $1600 + 1984 = 3,584$. 
+  - Depthwise: $200 + 248 = 448$.
+- **Conclusion (VERIFIED):** A 4-branch depthwise multi-scale module (448 params) is actually *smaller* than the baseline EEGNet temporal pathway (768 params). Parameter explosion is entirely avoided if we use depthwise convolutions.
 
-**DECISION:** The temporal block cannot be blindly hardcoded to `k=31` without a dynamic handling strategy if it is to support 0.1–0.25s windows. If multi-scale is used, large kernels must be dynamically bypassed, masked, or adaptively weighted when the input window is shorter than the kernel size.
+## 4. Window Compatibility (0.1s to 10s)
+At 64 Hz: 0.1s (6 samples), 0.25s (16 samples), 0.5s (32 samples), 1s (64 samples), 2s (128 samples), 5s (320 samples), 10s (640 samples).
+- **Short-Window Failure:** A fixed `k=31` convolution mathematically fails at 0.1s and 0.25s without absurd padding. A fixed `k=15` fails at 0.1s.
+- **Architectural Options for Variable Windows:**
+  - *A) Fixed multi-scale:* Forces extreme padding at short windows (Artifact-prone).
+  - *B) Conditional/Bypass:* Explicitly masks or drops the k=15 and k=31 branches when the input length is too short.
+  - *C) Scale-adaptive/dilated:* Uses small kernels with dynamic dilation factors.
+  - *D) Separate architectures:* Train a different model per window length.
+- **Decision (HYPOTHESIS):** Option B (Conditional/Bypass) is the most robust and biologically interpretable. If the signal is too short to estimate a 0.5-second trend, the network should dynamically rely solely on the surviving k=3 and k=7 branches, mimicking how humans perform ultra-fast heuristic auditory processing vs. delayed integrated processing.
 
-## 3. Evaluation of Candidate Kernels (SIGNAL-PROCESSING INFERENCE)
-Even though the signal is bandpass filtered at 1-6Hz (where a full 6Hz cycle is ~11 samples):
-- **k=3 (46.9 ms) & k=7 (109.4 ms)**: These kernels do not capture a full oscillatory cycle. However, they are highly effective at learning local slopes, onset/offset trajectories, and phase-shifts.
-- **k=15 (234.4 ms)**: Captures ~1.5 cycles of the upper band (6 Hz). Functions as a strong mid-range morphology extractor.
-- **k=31 (484.4 ms)**: Captures slow delta/theta oscillations and wide context.
-- **Padding Comparison:** The baseline EEGNet uses `k=64` (padding 32). Therefore, the previous argument that `k=31` (padding 15) contains "too much synthetic padding" is rejected. Padding is standard and historically validated in this pipeline.
+## 5. Architectural Alignment (Later Blocks)
+- **Output:** The temporal block will output a tensor of shape `[Batch, Scales*Filters, Time]`. 
+- **Compatibility:** This tensor preserves the exact temporal resolution (no downsampling). It seamlessly feeds the Frequency block (which can perform spectral attention across the concatenated scales) and the Spatial block (which can mix channels across all extracted temporal scales). 
 
-## 4. Multi-Scale Architecture Candidates (ARCHITECTURAL HYPOTHESIS)
-- **A) Single k=15**: Simple, parameter-efficient. **Fails** to capture wide 1-second context or isolated high-resolution slopes.
-- **B) Two-scale (k=7 + k=15)**: Better, but still misses the wide context that baseline EEGNet captures with k=64.
-- **C) MSCA Multi-Scale (k=3 + k=7 + k=15 + k=31)**: Evaluates the signal simultaneously at 4 distinct resolutions.
-  - **Expected Benefit:** Allows the network to learn both sharp local onsets (k=3) and wide slow-wave trends (k=31) simultaneously, potentially overcoming EEGNet's fixed k=64 limitation. This is crucial since historical DTU data shows longer temporal context directly improves AAD (from 57% at 2s to 77% at 30s).
-  - **Parameter Risk:** 4 parallel dense convolutions would overfit the 18 subjects.
-  - **Solution:** Depthwise/separable multi-scale temporal processing.
-  - **Short-Window Risk:** Fails mathematically at 0.1s windows without dynamic masking/bypassing.
+## 6. Experiment Design (Ablation Sequence)
+To prove that multi-scale processing actually drives the AAD improvement, we must run this exact ablation (keeping spatial/attention/loss strictly identical):
+- **E0 (Baseline):** Replace MSCA temporal block with EEGNet temporal block (k=64 -> k=16).
+- **E1 (1-Scale):** Single depthwise k=15.
+- **E2 (2-Scale):** Depthwise k=[7, 15].
+- **E3 (3-Scale):** Depthwise k=[3, 7, 15].
+- **E4 (4-Scale):** Depthwise k=[3, 7, 15, 31].
+*Justification requirement: E(N) must statistically outperform E(N-1) across the 1-10s windows to justify the addition of the larger scale.*
 
-## 5. Recommended Temporal Block & Falsifiable Experiment
-- **RECOMMENDED DESIGN:** A **Depthwise Multi-Scale Temporal Module (k=3, 7, 15, 31)**.
-- **Why:** It directly addresses the fixed-resolution limitation of the EEGNet baseline by extracting multi-resolution morphology, while depthwise operations keep parameters low enough to prevent overfitting.
-- **Falsifiable Experiment:** 
-  1. Train Baseline MatchNet (EEGNet encoder, k=64 -> k=16).
-  2. Train Modified MatchNet (New MSCA Depthwise Temporal encoder, k=[3,7,15,31] concatenated).
-  3. Compare LOSO AUROC on the 1-second to 10-second evaluation windows. If MSCA performs worse, the multi-scale hypothesis is rejected, and we revert to single-scale.
+## 7. Final Decision Summary
+- **VERIFIED FACTS:** The existing baseline uses large kernels (k=64, k=16) padded heavily. A depthwise 4-branch multi-scale block uses *fewer* temporal parameters (448) than the baseline (768).
+- **INFERENCES:** Small kernels (<10) capture local slopes/derivatives. Large kernels (>30) capture broad phase trends.
+- **HYPOTHESES:** Explicitly separating these scales forces the network to learn decoupled features (sharp vs smooth), which is better for AAD than a single k=64 kernel that might entangle them.
+- **RECOMMENDED TEMPORAL DESIGN:** A **Depthwise Multi-Scale Temporal Module** (`k=3, 7, 15, 31`) with **Dynamic Conditional Bypassing** for ultra-short windows (0.1-0.25s).
+- **WHY IT SHOULD IMPROVE AAD:** It solves the rigidity of the baseline by preserving sharp transients while simultaneously capturing long-range context, supporting both low-latency extraction and high-accuracy long-window aggregation.
+- **WHAT EXPERIMENT WOULD DISPROVE IT:** The E0-E4 ablation sequence. If E4 <= E0, the multi-scale temporal separation hypothesis is false.
