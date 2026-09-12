@@ -178,10 +178,20 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
     os.makedirs(REPO_ROOT / "checkpoints", exist_ok=True)
     os.makedirs(REPO_ROOT / "experiments", exist_ok=True)
     
+    loso_e0_baseline = {
+        "S1": 0.5833, "S10": 0.4833, "S11": 0.5500, "S12": 0.6500, 
+        "S13": 0.5833, "S14": 0.5666, "S15": 0.5833, "S16": 0.5166, 
+        "S17": 0.7500, "S18": 0.4666, "S2": 0.5166, "S3": 0.5333, 
+        "S4": 0.5333, "S5": 0.5833, "S6": 0.4333, "S7": 0.5500, 
+        "S8": 0.4500, "S9": 0.5666
+    }
+    
     all_subject_metrics = {}
+    detailed_logs = []
     
     for subject_path in all_paths:
         subject_id = subject_path.stem
+        sub_key = subject_id.replace("_data_preproc", "")
         print(f"\n{'='*50}\nEvaluating Subject: {subject_id}\n{'='*50}")
         print(f"  [Memory] Pre-subject RAM: {psutil.virtual_memory().percent}% ({psutil.virtual_memory().used / 1e9:.2f} GB used)")
         
@@ -195,17 +205,26 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
         for fold_idx, (train_idx, test_idx) in enumerate(kf.split(all_exs)):
             print(f"\n  --- Fold {fold_idx+1}/5 ---")
             
-            train_pool = [all_exs[i] for i in train_idx]
-            test_exs = [all_exs[i] for i in test_idx]
+            # Use strict index tracking to prevent any temporal leakage
+            train_pool_idx = list(train_idx)
+            test_idx_list = list(test_idx)
             
             # Split 10% of train_pool for validation early stopping
             np.random.seed(42 + fold_idx)
-            np.random.shuffle(train_pool)
-            val_split = max(1, int(0.1 * len(train_pool)))
-            val_exs = train_pool[:val_split]
-            train_exs = train_pool[val_split:]
+            np.random.shuffle(train_pool_idx)
+            val_split = max(1, int(0.1 * len(train_pool_idx)))
+            
+            val_idx_list = train_pool_idx[:val_split]
+            train_final_idx_list = train_pool_idx[val_split:]
+            
+            train_exs = [all_exs[i] for i in train_final_idx_list]
+            val_exs = [all_exs[i] for i in val_idx_list]
+            test_exs = [all_exs[i] for i in test_idx_list]
             
             print(f"  Train trials: {len(train_exs)} | Val trials: {len(val_exs)} | Test trials: {len(test_exs)}")
+            print(f"  [IDs] Train: {sorted(train_final_idx_list)}")
+            print(f"  [IDs] Val:   {sorted(val_idx_list)}")
+            print(f"  [IDs] Test:  {sorted(test_idx_list)}")
             
             X_tr_full, YA_tr_full, YB_tr_full = prepare_dataset(train_exs, channels, lowcut, highcut, subject_id, mapping, envelopes)
             X_va_full, YA_va_full, YB_va_full = prepare_dataset(val_exs, channels, lowcut, highcut, subject_id, mapping, envelopes)
@@ -236,6 +255,7 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
             scaler = torch.cuda.amp.GradScaler()
             
             best_val_acc = 0.0
+            best_epoch = 0
             best_weights = deepcopy(model.state_dict())
             patience = 10
             epochs_no_improve = 0
@@ -267,6 +287,7 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
                 
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
+                    best_epoch = epoch
                     best_weights = deepcopy(model.state_dict())
                     epochs_no_improve = 0
                 else:
@@ -282,7 +303,20 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
             test_acc = nc_te / max(nt_te, 1)
             fold_accs.append(test_acc)
             
+            print(f"  -> Fold {fold_idx+1} Best Epoch: {best_epoch+1} (Val Acc: {best_val_acc*100:.2f}%)")
             print(f"  -> Fold {fold_idx+1} Test Acc (10s Pearson): {test_acc*100:.2f}% ({nc_te}/{nt_te})")
+            
+            # Log exact trial-level metadata
+            detailed_logs.append({
+                "subject": subject_id,
+                "fold": fold_idx + 1,
+                "train_trial_ids": sorted(train_final_idx_list),
+                "val_trial_ids": sorted(val_idx_list),
+                "test_trial_ids": sorted(test_idx_list),
+                "best_epoch": best_epoch + 1,
+                "best_val_accuracy": best_val_acc,
+                "test_accuracy": test_acc
+            })
             
             # Cleanup memory per fold
             del X_tr, YA_tr, YB_tr, X_tr_full, YA_tr_full, YB_tr_full, X_va_full, YA_va_full, YB_va_full, X_te_full, YA_te_full, YB_te_full
@@ -292,19 +326,43 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
         all_subject_metrics[subject_id] = subj_mean_acc
         print(f"\n  [RESULT] {subject_id} Mean 5-Fold Within-Subject Accuracy: {subj_mean_acc*100:.2f}%")
         
-        # Save intermediate results in case of crash
+        # Save intermediate results
+        out_data = {
+            "summary_metrics": all_subject_metrics,
+            "detailed_logs": detailed_logs
+        }
         with open(REPO_ROOT / "experiments" / "matchnet_within_subject_results.json", "w") as f:
-            json.dump(all_subject_metrics, f, indent=4)
+            json.dump(out_data, f, indent=4)
             
-    print("\n" + "="*50)
-    print(f"[MATCHNET ({eeg_model.upper()}) WITHIN-SUBJECT CANONICAL E0 EVALUATION]")
-    print("="*50)
-    for subj, acc in all_subject_metrics.items():
-        print(f" {subj}: {acc*100:.2f}%")
-    print("-" * 50)
-    overall_mean = np.mean(list(all_subject_metrics.values()))
-    print(f" OVERALL MEAN: {overall_mean*100:.2f}%")
-    print("="*50)
+    print("\n" + "="*80)
+    print(f"[MATCHNET ({eeg_model.upper()}) WITHIN-SUBJECT DIAGNOSTIC (PHASE 0)]")
+    print("="*80)
+    print(f"{'Subject':<12} | {'Within-Subject':<15} | {'LOSO E0':<12} | {'Delta':<10}")
+    print("-" * 60)
+    
+    overall_within = []
+    overall_loso = []
+    
+    for subj in sorted(all_subject_metrics.keys()):
+        acc = all_subject_metrics[subj]
+        sub_key = subj.replace("_data_preproc", "")
+        loso_acc = loso_e0_baseline.get(sub_key, 0.0)
+        delta = acc - loso_acc
+        
+        overall_within.append(acc)
+        if loso_acc > 0.0:
+            overall_loso.append(loso_acc)
+            
+        print(f"{subj:<12} | {acc*100:>14.2f}% | {loso_acc*100:>11.2f}% | {delta*100:>+9.2f}%")
+        
+    print("-" * 60)
+    mean_within = np.mean(overall_within)
+    mean_loso = np.mean(overall_loso)
+    mean_delta = mean_within - mean_loso
+    
+    print(f"{'MEAN':<12} | {mean_within*100:>14.2f}% | {mean_loso*100:>11.2f}% | {mean_delta*100:>+9.2f}%")
+    print(f"{'MEDIAN':<12} | {np.median(overall_within)*100:>14.2f}% | {np.median(overall_loso)*100:>11.2f}% | {np.median(overall_within)-np.median(overall_loso):>+9.2f}%")
+    print("="*80)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Contrastive MatchNet Within-Subject")
