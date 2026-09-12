@@ -57,6 +57,12 @@ def run_subject_forensics():
         "decoder_similarity_matrix": np.zeros((len(subjects), len(subjects))).tolist()
     }
 
+    # Phase F2: Validate the Computations
+    assert len(subjects) == 18, f"Expected exactly 18 subjects, found {len(subjects)}"
+    for s in subjects:
+        num_trials = len(subject_examples[s])
+        assert num_trials == 60, f"Expected exactly 60 trials for subject {s}, found {num_trials}"
+
     # 1. Subject Properties (Bandpower, etc.) & Train subject-specific models
     subject_models = {} # dict of (weights, mean, std)
     
@@ -70,12 +76,17 @@ def run_subject_forensics():
             variances.append(np.var(ex.eeg, axis=1))
         avg_var = np.mean(variances)
         
-        # 5-fold CV for Oracle Accuracy
+        # 5-fold CV for Personalized CV Accuracy
         kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        oracle_correct = 0
-        oracle_total = 0
+        cv_correct = 0
+        cv_total = 0
         
         for train_idx, test_idx in kf.split(examples):
+            # Phase F2: Validate split sizes
+            assert len(train_idx) == 48, f"Expected 48 train trials, got {len(train_idx)}"
+            assert len(test_idx) == 12, f"Expected 12 test trials, got {len(test_idx)}"
+            assert len(set(train_idx).intersection(set(test_idx))) == 0, "Train/Test overlap detected!"
+            
             train_ex = [examples[i] for i in train_idx]
             test_ex = [examples[i] for i in test_idx]
             
@@ -95,10 +106,10 @@ def run_subject_forensics():
                 targets.append(t)
                 distractors.append(d)
                 
-            oracle_correct += sum(1 for p, t, d in zip(preds, targets, distractors) if scipy.stats.pearsonr(p, t)[0] > scipy.stats.pearsonr(p, d)[0])
-            oracle_total += len(test_ex)
+            cv_correct += sum(1 for p, t, d in zip(preds, targets, distractors) if scipy.stats.pearsonr(p, t)[0] > scipy.stats.pearsonr(p, d)[0])
+            cv_total += len(test_ex)
             
-        oracle_acc = oracle_correct / oracle_total
+        personalized_cv_acc = cv_correct / cv_total
         
         # Full subject model (for transfer matrix and similarity)
         full_f_mean, full_f_std = feature_statistics(examples, channel_ids=None)
@@ -107,7 +118,7 @@ def run_subject_forensics():
         
         results["metrics"][s] = {
             "bandpower": float(avg_var),
-            "oracle_acc": float(oracle_acc)
+            "personalized_cv_acc": float(personalized_cv_acc)
         }
         
     # 2. LOSO Accuracy
@@ -134,8 +145,8 @@ def run_subject_forensics():
             
         loso_acc = evaluate_predictions(preds, targets, distractors)
         results["metrics"][s]["loso_acc"] = float(loso_acc)
-        results["metrics"][s]["oracle_gain"] = float(results["metrics"][s]["oracle_acc"] - loso_acc)
-        print(f"Subject {s}: LOSO={loso_acc:.4f}, Oracle={results['metrics'][s]['oracle_acc']:.4f}, Gain={results['metrics'][s]['oracle_gain']:.4f}")
+        results["metrics"][s]["personalized_cv_gain"] = float(results["metrics"][s]["personalized_cv_acc"] - loso_acc)
+        print(f"Subject {s}: LOSO={loso_acc:.4f}, PersonalizedCV={results['metrics'][s]['personalized_cv_acc']:.4f}, Gain={results['metrics'][s]['personalized_cv_gain']:.4f}")
 
     # 3. Transfer Matrix & Similarity
     print("Computing Transfer Matrix and Similarity...")
