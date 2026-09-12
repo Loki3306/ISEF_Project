@@ -132,6 +132,21 @@ def contrastive_loss(z_eeg, z_a, z_b, margin=0.1):
     
     return loss, sim_a_mean.mean(), sim_b_mean.mean()
 
+def anchored_contrastive_loss(z_eeg, z_a, z_b, margin=0.1, lambda_align=0.5, align_target=0.1):
+    """
+    Computes a max-margin contrastive loss while explicitly anchoring r_A to be positive.
+    Penalizes if sim_a_mean falls below align_target.
+    """
+    sim_a_mean = _compute_mean_cosine_similarity(z_eeg, z_a)
+    sim_b_mean = _compute_mean_cosine_similarity(z_eeg, z_b)
+    
+    l_margin = F.relu(margin - (sim_a_mean - sim_b_mean)).mean()
+    l_align = F.relu(align_target - sim_a_mean).mean()
+    
+    loss = l_margin + lambda_align * l_align
+    
+    return loss, sim_a_mean.mean(), sim_b_mean.mean()
+
 def infonce_loss(z_eeg, z_a, z_b, temperature=0.1):
     """
     Computes an InfoNCE loss across the batch.

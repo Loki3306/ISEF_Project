@@ -1,8 +1,9 @@
 import json
-import csv
-import numpy as np
 from pathlib import Path
+import numpy as np
+import csv
 from scipy.stats import pearsonr
+import argparse
 
 def main():
     repo_root = Path(__file__).resolve().parents[3]
@@ -142,6 +143,7 @@ def main():
 - **S4 Q4 (Catastrophic Phase Inversion, $r_A < 0, r_B > 0$):** {s4_q4_all*100:.1f}%
 - **S4 Q2 (Pure rejection, $r_A < 0, r_B < 0$):** {s4_q2_all*100:.1f}%
 **Conclusion:** {"S4 is heavily in Q3, proving it is stimulus confusion (it generates positive correlations for both, but the distractor is stronger)." if s4_q3_all > s4_q4_all else "S4 still shows significant Q4 behavior, keeping phase inversion as a possible factor."}
+*(Note: If running a smoke-test without S4, these values will be 0%)*
 
 ## Per-Subject Data Summary
 
@@ -161,4 +163,10 @@ def main():
         print("\n\n" + f.read())
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Behavioral Audit Analysis")
+    parser.add_argument("--smoke_test", action="store_true", help="Run in smoke test mode")
+    args = parser.parse_args()
+    
+    # We don't actually need to pass args to main since it just reads the JSON, 
+    # but parsing the args prevents it from crashing when called with --smoke_test
     main()

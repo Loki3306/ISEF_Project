@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = REPO_ROOT.parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from models.matchnet import ContrastiveMatchNet, contrastive_loss
+from models.matchnet import ContrastiveMatchNet, contrastive_loss, anchored_contrastive_loss
 from baselines.ridge_aad import load_subject_examples, subject_files
 
 FS = 64
@@ -178,7 +178,7 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, metric="cosine", d
         return metrics
     return metrics["n_correct"], metrics["n_total"]
 
-def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None):
+def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, smoke_test=False):
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | MatchNet ({eeg_model}) Within-Subject | Channels: {channels}")
@@ -190,7 +190,10 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
         print("No subjects found.")
         return
         
-    if subjects_to_run:
+    if smoke_test:
+        smoke_subjects = ["S5_data_preproc", "S6_data_preproc", "S8_data_preproc", "S10_data_preproc"]
+        all_paths = [p for p in all_paths if p.stem in smoke_subjects]
+    elif subjects_to_run:
         all_paths = [p for p in all_paths if p.stem in subjects_to_run]
         
     os.makedirs(REPO_ROOT / "checkpoints", exist_ok=True)
@@ -293,7 +296,10 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
                     optimizer.zero_grad()
                     with torch.cuda.amp.autocast():
                         z_eeg, z_a, z_b = model(bx, bya, byb)
-                        loss, sa, sb = contrastive_loss(z_eeg, z_a, z_b, margin=0.1)
+                        if loss_type == "anchored":
+                            loss, sa, sb = anchored_contrastive_loss(z_eeg, z_a, z_b, margin=0.1, lambda_align=lambda_align, align_target=align_target)
+                        else:
+                            loss, sa, sb = contrastive_loss(z_eeg, z_a, z_b, margin=0.1)
                     
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
@@ -420,6 +426,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=512, help="Training batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="Dataloader num_workers")
     parser.add_argument("--subjects", type=str, nargs='+', default=None, help="Specific subjects to run")
+    parser.add_argument("--loss", type=str, default="contrastive", choices=["contrastive", "anchored"], help="Loss function to use")
+    parser.add_argument("--lambda_align", type=float, default=0.5, help="Lambda for alignment penalty")
+    parser.add_argument("--align_target", type=float, default=0.1, help="Positive alignment target for anchored loss")
+    parser.add_argument("--smoke_test", action="store_true", help="Run only on S5, S6, S8, S10 for fast iteration")
     args = parser.parse_args()
     
-    train_matchnet_within_subject(args.model, args.channels, args.lowcut, args.highcut, args.batch_size, args.num_workers, args.subjects)
+    train_matchnet_within_subject(args.model, args.channels, args.lowcut, args.highcut, args.batch_size, args.num_workers, args.subjects, args.loss, args.lambda_align, args.align_target, args.smoke_test)
