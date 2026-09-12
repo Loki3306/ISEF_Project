@@ -52,7 +52,11 @@
 
 ## 10. EEG ↔ audio mapping
 - Handled by `audio_mapping.json`.
-- `train_matchnet_loso.py` loads the subject/trial key (e.g. `S1` -> `trial_0`) to find `wavA` and `wavB` filenames, which are then used to index into the `.pkl` cache (VERIFIED).
+- **CRITICAL CLARIFICATION (KAGGLE vs LOCAL):** The `audio_mapping.json` file is *not* stored inside the massive Kaggle dataset along with the `.mat` files. Instead, it is a lightweight JSON file tracked directly inside the Git repository (`data/audio_mapping.json`). 
+- This file explicitly maps each trial (e.g. `S1` -> `trial_0`) to exactly two external `.wav` files.
+  - `wavA`: Contains the filename of the *attended* audio (e.g., `marianne_story3_trial_1.wav`).
+  - `wavB`: Contains the filename of the *unattended* audio (e.g., `aske_story4_trial_1.wav`).
+- `train_matchnet_loso.py` loads this Git-tracked JSON to find the filenames, and then looks up the corresponding processed audio tensors.
 - Trials are truncated to `min(eeg_len, wav_len)` (VERIFIED).
 
 ## 11. Audio preprocessing / Gammatone pipeline
