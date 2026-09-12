@@ -9,8 +9,10 @@ import subprocess
 def setup_repo():
     repo_path = Path('/kaggle/working/EEG_Training_New')
     if not repo_path.exists():
-        print("Cloning EEG_Training_New...")
-        subprocess.run(["git", "clone", "https://github.com/Loki3306/EEG_Training_New.git", str(repo_path)], check=True)
+        print("ERROR: EEG_Training_New repository not found at /kaggle/working/EEG_Training_New")
+        print("Please clone it manually in Kaggle before running this script.")
+        print("Example: git clone https://<your_token>@github.com/Loki3306/EEG_Training_New.git /kaggle/working/EEG_Training_New")
+        sys.exit(1)
     
     sys.path.insert(0, str(repo_path))
 
