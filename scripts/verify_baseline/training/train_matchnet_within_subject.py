@@ -362,7 +362,9 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
             "abs_acc": subj_mean_abs_acc,
             "median_r_corr": median_r_corr,
             "median_abs_r_corr": median_abs_r_corr,
-            "neg_frac": neg_frac
+            "neg_frac": neg_frac,
+            "r_correct_array": [float(x) for x in subject_r_correct],
+            "r_incorrect_array": [float(x) for x in subject_r_incorrect]
         }
         
         print(f"\n  [RESULT] {subject_id} Metrics:")
