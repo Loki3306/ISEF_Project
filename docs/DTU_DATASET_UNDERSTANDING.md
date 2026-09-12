@@ -1,4 +1,4 @@
-# DTU Dataset — Complete Data Understanding
+# DTU Dataset â€” Complete Data Understanding
 
 ## 1. Dataset overview
 - **Subjects:** 18 normal hearing subjects (VERIFIED).
@@ -50,7 +50,7 @@
 - Stereo/Mono raw `.wav` files of Danish stories.
 - Audio is processed into envelopes via `extract_gammatone_envelopes.py` and saved as `gammatone_envelopes.pkl` (VERIFIED).
 
-## 10. EEG ↔ audio mapping
+## 10. EEG â†” audio mapping
 - Handled by `audio_mapping.json`.
 - **CRITICAL CLARIFICATION (KAGGLE vs LOCAL):** The `audio_mapping.json` file is *not* stored inside the massive Kaggle dataset along with the `.mat` files. Instead, it is a lightweight JSON file tracked directly inside the Git repository (`data/audio_mapping.json`). 
 - This file explicitly maps each trial (e.g. `S1` -> `trial_0`) to exactly two external `.wav` files.
@@ -126,7 +126,7 @@ RAW EEG (.mat)                   RAW AUDIO (.wav)
 ```
 
 
-# Block 1 � Input & Preprocessing
+# Block 1 — Input & Preprocessing
 
 ## 1. Exact Channel Mapping & Ordering
 - **VERIFIED FACT**: The BioSemi64 + EXG setup yields 66 channels in the .mat file. Python zero-based indexing maps 0 to Fp1, 1 to AF7, ..., 65 to EXG2.
@@ -141,7 +141,7 @@ RAW EEG (.mat)                   RAW AUDIO (.wav)
 - **VERIFIED FACT**:
   - **MATLAB**: 50 Hz line-noise removal, downsampling (512->64), 0.1 Hz high-pass, EOG Regression (VEOG/HEOG), Common Average Reference (CAR).
   - **Python**: Bandpass filtering (1.0 Hz - 6.0 Hz by default).
-- **DECISION**: Freeze Python preprocessing at **1�6 Hz** for the first architecture experiment. Expanding the frequency band will be treated as a separate controlled experiment later.
+- **DECISION**: Freeze Python preprocessing at **1–6 Hz** for the first architecture experiment. Expanding the frequency band will be treated as a separate controlled experiment later.
 
 ## 4. Normalization & Leakage Limitations
 - **VERIFIED FACT**: Normalization happens in Python. It is **Per-Channel, Per-Trial Z-score Normalization** (similarly per-band, per-trial for audio).
@@ -162,30 +162,48 @@ RAW EEG (.mat)                   RAW AUDIO (.wav)
 - None for Block 1. Block 1 is now rigorously defined and frozen for the first set of architecture experiments.
 
 
-# Block 2 � EEG Temporal Feature Extraction
+# Block 2 — EEG Temporal Feature Extraction
 
-## 1. Temporal Information in 1-Second (64-Sample) Window
-- **VERIFIED FROM PROJECT/DATA**: The input is 64 samples (1.0 seconds) at 64 Hz, strictly bandpass filtered at 1�6 Hz.
-- **INFERENCE (Physics/Signal Processing)**: A 1 Hz wave has a period of 64 samples (1000 ms). A 6 Hz wave has a period of ~10.7 samples (~167 ms). Because the signal is bounded at 1-6 Hz, it contains NO high-frequency transients. The signal is highly smoothed. Any kernel smaller than 10 samples cannot capture a full oscillation of even the highest frequency in the band.
+## 1. The Existing EEGNet Baseline (VERIFIED FROM PROJECT)
+- The historical MatchNet baseline uses an EEGNet temporal encoder with a massive initial **k=64** (1.0s) temporal convolution, padded with 32 zeros on each side.
+- This is followed by a spatial depthwise convolution and a **k=16** (0.25s) depthwise separable temporal refinement.
+- **Limitation of the Baseline:** A fixed 64-sample kernel applies a very wide, fixed-resolution temporal window. While this is highly effective for long offline windows, it limits the network's ability to selectively focus on short, high-frequency morphological features (like onset slopes) independently of the broad 1-second trend. It is also structurally rigid if we intend to support ultra-low-latency short windows (e.g., 0.1s / 6 samples).
 
-## 2. Evaluation of Candidate Kernels (at 64 Hz)
-- **k = 3 (46.9 ms)**: Captures local gradients/slopes. Sub-cycle for 1-6 Hz. (INFERENCE)
-- **k = 7 (109.4 ms)**: Sub-cycle for 1-6 Hz. Captures half-waves. (INFERENCE)
-- **k = 15 (234.4 ms)**: Captures at least one full cycle of the 6 Hz upper bound. Good mid-range feature extractor. (INFERENCE)
-- **k = 31 (484.4 ms)**: Captures nearly 50% of the entire 1-second window. (VERIFIED FROM PROJECT/DATA)
-  - **Failure Mode**: If padded (e.g. `padding="same"`), it requires 15 zeros on each side, meaning ~47% of the edges are synthetic padding, causing massive edge artifacts. If unpadded, the sequence shrinks from 64 to 34, destroying temporal resolution for later fusion blocks. (INFERENCE)
+## 2. Multi-Window Analysis & Short-Window Feasibility (ARCHITECTURAL CONSTRAINT)
+The proposed MSCA architecture must support the following evaluation windows:
+- 0.1 s → ~6 samples
+- 0.25 s → 16 samples
+- 0.5 s → 32 samples
+- 1.0 s → 64 samples
+- 2.0 s, 5.0 s, 10.0 s → >128 samples
 
-## 3. Evaluation of the Proposed MSCA Branches (k=3, 7, 15, 31)
-- **ARCHITECTURAL HYPOTHESIS / VERDICT**: The MSCA proposal of four parallel branches is drastically over-parameterized for a 1-6 Hz, 64-sample signal. The k=31 branch is too large and will cause severe edge artifacts or resolution loss. Furthermore, 4 parallel dense convolutions will likely overfit the limited 18-subject DTU dataset. We reject the 4-branch k=31 proposal for Block 2.
+**Behavior of MSCA Kernels (k=3, 7, 15, 31) at short windows:**
+- For a 1s window (64 samples), all kernels are fully valid local operators.
+- For a 0.25s window (16 samples), `k=31` is physically larger than the entire input sequence. A convolution would either crash or require >50% zero-padding to simply execute, turning it into a massive global padding-artifact generator rather than a local feature extractor.
+- For a 0.1s window (6 samples), `k=7, 15, 31` are all mathematically invalid as local convolutions without extreme padding.
 
-## 4. Architectural Candidates
-- **A) Single dense temporal convolution**: Parameter heavy ($C_{in} \times C_{out} \times K$).
-- **B) Depthwise temporal convolution**: Applies filters per-channel independently. Massive parameter reduction ($C \times K$). Highly appropriate for small datasets (used effectively in EEGNet). (INFERENCE)
-- **C) Two-scale depthwise convolution (e.g., k=7, k=15)**: Captures sub-cycle gradients and full-cycle 6Hz oscillations without catastrophic edge effects.
+**DECISION:** The temporal block cannot be blindly hardcoded to `k=31` without a dynamic handling strategy if it is to support 0.1–0.25s windows. If multi-scale is used, large kernels must be dynamically bypassed, masked, or adaptively weighted when the input window is shorter than the kernel size.
 
-## 5. Temporal Downsampling
-- **DECISION**: Do not downsample/stride in the temporal encoder. We only have 64 samples. We need to preserve temporal resolution for alignment with the audio envelope later. (ARCHITECTURAL HYPOTHESIS)
+## 3. Evaluation of Candidate Kernels (SIGNAL-PROCESSING INFERENCE)
+Even though the signal is bandpass filtered at 1-6Hz (where a full 6Hz cycle is ~11 samples):
+- **k=3 (46.9 ms) & k=7 (109.4 ms)**: These kernels do not capture a full oscillatory cycle. However, they are highly effective at learning local slopes, onset/offset trajectories, and phase-shifts.
+- **k=15 (234.4 ms)**: Captures ~1.5 cycles of the upper band (6 Hz). Functions as a strong mid-range morphology extractor.
+- **k=31 (484.4 ms)**: Captures slow delta/theta oscillations and wide context.
+- **Padding Comparison:** The baseline EEGNet uses `k=64` (padding 32). Therefore, the previous argument that `k=31` (padding 15) contains "too much synthetic padding" is rejected. Padding is standard and historically validated in this pipeline.
 
-## 6. Recommended Temporal Block
-- **RECOMMENDATION**: A single Depthwise Temporal Convolution (k=15) OR a Two-Scale Depthwise Convolution (k=7, k=15).
-- **Why**: Depthwise convolution strictly controls parameter count to prevent overfitting the 18 subjects. k=15 (234ms) is perfectly sized to capture the 6 Hz cycles (167ms) without crossing the 50% window threshold that causes catastrophic padding artifacts. It is the absolute smallest, most interpretable mechanism to extract temporal morphology before moving to spatial blocks.
+## 4. Multi-Scale Architecture Candidates (ARCHITECTURAL HYPOTHESIS)
+- **A) Single k=15**: Simple, parameter-efficient. **Fails** to capture wide 1-second context or isolated high-resolution slopes.
+- **B) Two-scale (k=7 + k=15)**: Better, but still misses the wide context that baseline EEGNet captures with k=64.
+- **C) MSCA Multi-Scale (k=3 + k=7 + k=15 + k=31)**: Evaluates the signal simultaneously at 4 distinct resolutions.
+  - **Expected Benefit:** Allows the network to learn both sharp local onsets (k=3) and wide slow-wave trends (k=31) simultaneously, potentially overcoming EEGNet's fixed k=64 limitation. This is crucial since historical DTU data shows longer temporal context directly improves AAD (from 57% at 2s to 77% at 30s).
+  - **Parameter Risk:** 4 parallel dense convolutions would overfit the 18 subjects.
+  - **Solution:** Depthwise/separable multi-scale temporal processing.
+  - **Short-Window Risk:** Fails mathematically at 0.1s windows without dynamic masking/bypassing.
+
+## 5. Recommended Temporal Block & Falsifiable Experiment
+- **RECOMMENDED DESIGN:** A **Depthwise Multi-Scale Temporal Module (k=3, 7, 15, 31)**.
+- **Why:** It directly addresses the fixed-resolution limitation of the EEGNet baseline by extracting multi-resolution morphology, while depthwise operations keep parameters low enough to prevent overfitting.
+- **Falsifiable Experiment:** 
+  1. Train Baseline MatchNet (EEGNet encoder, k=64 -> k=16).
+  2. Train Modified MatchNet (New MSCA Depthwise Temporal encoder, k=[3,7,15,31] concatenated).
+  3. Compare LOSO AUROC on the 1-second to 10-second evaluation windows. If MSCA performs worse, the multi-scale hypothesis is rejected, and we revert to single-scale.
