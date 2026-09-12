@@ -125,11 +125,17 @@ def pearson_corr(x, y, dim=1):
     var_y = (y_centered ** 2).sum(dim=dim)
     return cov / torch.sqrt(var_x * var_y + 1e-8)
 
-def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, metric="cosine"):
+def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, metric="cosine", detailed_metrics=False):
     model.eval()
     window_samples = int(window_sec * FS)
-    n_correct = 0.0
-    n_total = 0
+    
+    metrics = {
+        "n_correct": 0.0,
+        "n_correct_abs": 0.0,
+        "n_total": 0,
+        "r_correct_list": [],
+        "r_incorrect_list": []
+    }
     
     with torch.no_grad():
         for i in range(len(X)):
@@ -151,15 +157,26 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, metric="cosine"):
                     sim_a = F.cosine_similarity(z_eeg, z_a, dim=1).mean().item()
                     sim_b = F.cosine_similarity(z_eeg, z_b, dim=1).mean().item()
                 
+                if detailed_metrics:
+                    metrics["r_correct_list"].append(sim_a)
+                    metrics["r_incorrect_list"].append(sim_b)
+                
                 if sim_a > sim_b:
-                    n_correct += 1.0
+                    metrics["n_correct"] += 1.0
                 elif sim_a == sim_b:
-                    n_correct += 0.5
+                    metrics["n_correct"] += 0.5
                     
-                n_total += 1
+                if abs(sim_a) > abs(sim_b):
+                    metrics["n_correct_abs"] += 1.0
+                elif abs(sim_a) == abs(sim_b):
+                    metrics["n_correct_abs"] += 0.5
+                    
+                metrics["n_total"] += 1
                 start += window_samples
                 
-    return n_correct, n_total
+    if detailed_metrics:
+        return metrics
+    return metrics["n_correct"], metrics["n_total"]
 
 def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None):
     torch.backends.cudnn.benchmark = True
@@ -202,6 +219,9 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
             
         kf = KFold(n_splits=5, shuffle=True, random_state=42)
         fold_accs = []
+        fold_accs_abs = []
+        subject_r_correct = []
+        subject_r_incorrect = []
         
         for fold_idx, (train_idx, test_idx) in enumerate(kf.split(all_exs)):
             print(f"\n  --- Fold {fold_idx+1}/5 ---")
@@ -300,12 +320,17 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
             model.load_state_dict(best_weights)
             
             # Evaluate Fold Test Set
-            nc_te, nt_te = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=10, metric="pearson")
-            test_acc = nc_te / max(nt_te, 1)
+            metrics_te = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=10, metric="pearson", detailed_metrics=True)
+            test_acc = metrics_te["n_correct"] / max(metrics_te["n_total"], 1)
+            test_acc_abs = metrics_te["n_correct_abs"] / max(metrics_te["n_total"], 1)
+            
             fold_accs.append(test_acc)
+            fold_accs_abs.append(test_acc_abs)
+            subject_r_correct.extend(metrics_te["r_correct_list"])
+            subject_r_incorrect.extend(metrics_te["r_incorrect_list"])
             
             print(f"  -> Fold {fold_idx+1} Best Epoch: {best_epoch+1} (Val Acc: {best_val_acc*100:.2f}%)")
-            print(f"  -> Fold {fold_idx+1} Test Acc (10s Pearson): {test_acc*100:.2f}% ({nc_te}/{nt_te})")
+            print(f"  -> Fold {fold_idx+1} Test Acc (Signed): {test_acc*100:.2f}% | (Abs): {test_acc_abs*100:.2f}%")
             
             # Log exact trial-level metadata
             detailed_logs.append({
@@ -316,7 +341,8 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
                 "test_trial_ids": [int(x) for x in sorted(test_idx_list)],
                 "best_epoch": int(best_epoch + 1),
                 "best_val_accuracy": float(best_val_acc),
-                "test_accuracy": float(test_acc)
+                "test_accuracy": float(test_acc),
+                "test_accuracy_abs": float(test_acc_abs)
             })
             
             # Cleanup memory per fold
@@ -324,46 +350,64 @@ def train_matchnet_within_subject(eeg_model, channels, lowcut, highcut, batch_si
             gc.collect()
             
         subj_mean_acc = np.mean(fold_accs)
-        all_subject_metrics[subject_id] = subj_mean_acc
-        print(f"\n  [RESULT] {subject_id} Mean 5-Fold Within-Subject Accuracy: {subj_mean_acc*100:.2f}%")
+        subj_mean_abs_acc = np.mean(fold_accs_abs)
+        
+        r_correct_arr = np.array(subject_r_correct)
+        median_r_corr = float(np.median(r_correct_arr)) if len(r_correct_arr) > 0 else 0.0
+        median_abs_r_corr = float(np.median(np.abs(r_correct_arr))) if len(r_correct_arr) > 0 else 0.0
+        neg_frac = float(np.mean(r_correct_arr < 0)) if len(r_correct_arr) > 0 else 0.0
+        
+        all_subject_metrics[subject_id] = {
+            "signed_acc": subj_mean_acc,
+            "abs_acc": subj_mean_abs_acc,
+            "median_r_corr": median_r_corr,
+            "median_abs_r_corr": median_abs_r_corr,
+            "neg_frac": neg_frac
+        }
+        
+        print(f"\n  [RESULT] {subject_id} Metrics:")
+        print(f"    - Signed Acc:     {subj_mean_acc*100:.2f}%")
+        print(f"    - Abs Acc:        {subj_mean_abs_acc*100:.2f}%")
+        print(f"    - Median r_corr:  {median_r_corr:.4f}")
+        print(f"    - Median |r_corr|:{median_abs_r_corr:.4f}")
+        print(f"    - Neg Fraction:   {neg_frac*100:.1f}%")
         
         # Save intermediate results
         out_data = {
             "summary_metrics": all_subject_metrics,
             "detailed_logs": detailed_logs
         }
-        with open(PROJECT_ROOT / "experiments" / "matchnet_within_subject_results.json", "w") as f:
+        with open(PROJECT_ROOT / "experiments" / "matchnet_within_subject_forensics.json", "w") as f:
             json.dump(out_data, f, indent=4)
             
-    print("\n" + "="*80)
-    print(f"[MATCHNET ({eeg_model.upper()}) WITHIN-SUBJECT DIAGNOSTIC (PHASE 0)]")
-    print("="*80)
-    print(f"{'Subject':<12} | {'Within-Subject':<15} | {'LOSO E0':<12} | {'Delta':<10}")
-    print("-" * 60)
+    print("\n" + "="*100)
+    print(f"[MATCHNET ({eeg_model.upper()}) CORRELATION-SIGN FORENSIC ANALYSIS]")
+    print("="*100)
+    print(f"{'Subject':<12} | {'Signed Acc':<10} | {'Abs Acc':<10} | {'med(r_corr)':<12} | {'med(|r_corr|)':<14} | {'Neg Frac':<10}")
+    print("-" * 100)
     
-    overall_within = []
-    overall_loso = []
+    overall_signed = []
+    overall_abs = []
     
     for subj in sorted(all_subject_metrics.keys()):
-        acc = all_subject_metrics[subj]
-        sub_key = subj.replace("_data_preproc", "")
-        loso_acc = loso_e0_baseline.get(sub_key, 0.0)
-        delta = acc - loso_acc
+        metrics = all_subject_metrics[subj]
+        acc = metrics["signed_acc"]
+        abs_acc = metrics["abs_acc"]
+        med_r = metrics["median_r_corr"]
+        med_abs_r = metrics["median_abs_r_corr"]
+        neg_frac = metrics["neg_frac"]
         
-        overall_within.append(acc)
-        if loso_acc > 0.0:
-            overall_loso.append(loso_acc)
+        overall_signed.append(acc)
+        overall_abs.append(abs_acc)
             
-        print(f"{subj:<12} | {acc*100:>14.2f}% | {loso_acc*100:>11.2f}% | {delta*100:>+9.2f}%")
+        print(f"{subj:<12} | {acc*100:>9.2f}% | {abs_acc*100:>9.2f}% | {med_r:>12.4f} | {med_abs_r:>14.4f} | {neg_frac*100:>8.1f}%")
         
-    print("-" * 60)
-    mean_within = np.mean(overall_within)
-    mean_loso = np.mean(overall_loso)
-    mean_delta = mean_within - mean_loso
+    print("-" * 100)
+    mean_signed = np.mean(overall_signed)
+    mean_abs = np.mean(overall_abs)
     
-    print(f"{'MEAN':<12} | {mean_within*100:>14.2f}% | {mean_loso*100:>11.2f}% | {mean_delta*100:>+9.2f}%")
-    print(f"{'MEDIAN':<12} | {np.median(overall_within)*100:>14.2f}% | {np.median(overall_loso)*100:>11.2f}% | {np.median(overall_within)-np.median(overall_loso):>+9.2f}%")
-    print("="*80)
+    print(f"{'MEAN':<12} | {mean_signed*100:>9.2f}% | {mean_abs*100:>9.2f}% | {'-':>12} | {'-':>14} | {'-':>9}")
+    print("="*100)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Contrastive MatchNet Within-Subject")
