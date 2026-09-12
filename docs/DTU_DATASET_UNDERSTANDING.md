@@ -227,3 +227,58 @@ To prove that multi-scale processing actually drives the AAD improvement, we mus
 - **RECOMMENDED TEMPORAL DESIGN:** A **Depthwise Multi-Scale Temporal Module** (`k=3, 7, 15, 31`) with **Dynamic Conditional Bypassing** for ultra-short windows (0.1-0.25s).
 - **WHY IT SHOULD IMPROVE AAD:** It solves the rigidity of the baseline by preserving sharp transients while simultaneously capturing long-range context, supporting both low-latency extraction and high-accuracy long-window aggregation.
 - **WHAT EXPERIMENT WOULD DISPROVE IT:** The E0-E4 ablation sequence. If E4 <= E0, the multi-scale temporal separation hypothesis is false.
+
+
+# Block 3 — EEG Frequency Representation
+
+## 1. Current Baseline Frequency Content (VERIFIED FACT)
+- **Raw EEG frequency content:** Originally recorded at 512 Hz, capable of capturing up to 256 Hz.
+- **MATLAB preprocessing:** High-pass filtered at 0.1 Hz and downsampled to 64 Hz (retains 0.1–32 Hz).
+- **Python preprocessing:** Bandpass filtered rigidly to **1–6 Hz**.
+- **EEGNet Temporal Convolutions:** The unconstrained k=64 and k=16 temporal convolutions act as data-driven FIR filters. They implicitly learn frequency-selective representations (phase and amplitude) optimized for the task within whatever frequencies remain in the input.
+
+## 2. Core Question (SIGNAL-PROCESSING INFERENCE)
+**Does the new architecture need an explicit frequency representation?**
+An unconstrained Temporal Convolution (Block 2) is mathematically a finite impulse response (FIR) filter. It already learns to isolate specific frequencies. An explicit frequency representation is only required if the temporal convolutions struggle to learn clean frequency boundaries from the limited 18-subject dataset, in which case parameterized filters (like SincConv) can heavily regularize the learning process.
+
+## 3. Candidate Evaluation
+- **A) No explicit frequency branch (F0)**
+  - *Mechanism:* Relies entirely on Block 2 to learn spectral-temporal features.
+  - *Parameters:* 0 additional. *Suitability for LOSO:* Very high.
+  - *Limitation:* Temporal filters might become noisy/overfit without explicit frequency regularization.
+- **B) Fixed sub-band representation (F1)**
+  - *Mechanism:* Pre-computes filter-banks (e.g., Delta 1-4Hz, Theta 4-6Hz).
+  - *Parameters:* 0 learned. *Limitation:* Boundaries are handcrafted and rigid.
+- **C) Learnable SincConv (F2)**
+  - *Mechanism:* Learns parameterized bandpass filters (low cut, high cut).
+  - *Parameters:* Extremely low (~2 parameters per filter).
+  - *Expected Benefit:* Enforces clean biological bandpass shapes while adapting to optimal AAD bands.
+- **D) STFT/Wavelet**
+  - *Mechanism:* Time-frequency maps. *Limitation:* High memory footprint, massive overkill for a 1-6 Hz bandpassed signal.
+
+## 4. Critical Sinc Limitation (SIGNAL-PROCESSING INFERENCE)
+A SincConv layer operates linearly. It **CANNOT** recover frequencies removed by the upstream 1–6 Hz filter (e.g., Alpha 8-12Hz, Beta 15-30Hz).
+- **A) SincConv on 1–6 Hz:** Can only learn to subdivide the 1-6 Hz band (e.g., separating Delta 1-4Hz from Theta 4-6Hz).
+- **B) SincConv on broader-band:** Would allow the network to discover AAD-relevant frequencies across the entire spectrum. *(FUTURE EXPERIMENT)*
+
+## 5. Frequency Resolution & Multi-Window Constraints (SIGNAL-PROCESSING INFERENCE)
+Can useful sub-bands be learned within 1-6 Hz? The frequency resolution limit is $\Delta f \approx 1/T$.
+- **1.0s window:** $\Delta f \approx 1$ Hz. SincConv could reasonably distinguish a 1-3 Hz band from a 4-6 Hz band.
+- **0.25s window:** $\Delta f \approx 4$ Hz. It is **physically impossible** to resolve sub-bands inside a 1-6 Hz signal.
+- **0.1s window:** $\Delta f \approx 10$ Hz.
+- **Conclusion:** SincConv on a 1-6 Hz signal only functions as a frequency discriminator for windows $\geq$ 1 second. For ultra-short windows, it provides zero frequency resolution.
+
+## 6. Architectural Complementarity (ARCHITECTURAL HYPOTHESIS)
+If the frequency branch simply applies SincConv and retains phase (without envelope extraction or spectral pooling), it is mathematically just another 1D convolution. It would essentially duplicate the function of Block 2, merely with a different initialization and regularization shape. To be truly complementary, a frequency branch must extract spectral *power* (e.g., via Hilbert envelopes or magnitude pooling), while Block 2 extracts phase-locked *morphology*.
+
+## 7. Experiment Design (Ablation Sequence)
+To test whether frequency representation is necessary, keep everything (including Block 2) identical:
+- **F0:** Block 2 temporal representation only.
+- **F1:** Temporal + fixed frequency representation (Delta/Theta banks).
+- **F2:** Temporal + learned Sinc frequency representation (on 1-6 Hz).
+- **F3:** Broader preprocessing (e.g., 0.1-32 Hz) + learned Sinc frequency representation. *(FUTURE PREPROCESSING EXPERIMENT)*
+
+## 8. Final Recommendation & Falsification
+- **RECOMMENDATION (ARCHITECTURAL HYPOTHESIS):** Use **F0 (No explicit frequency branch)** as the primary baseline for the first architecture, treating **F2 (SincConv on 1-6 Hz)** strictly as an ablation.
+- **Why:** The upstream 1-6 Hz preprocessing severely limits the spectrum. The uncertainty principle dictates that frequency discrimination inside a tight 5-Hz band is physically impossible for the 0.1s - 0.5s windows we intend to support. Therefore, an explicit frequency branch risks being entirely mathematically redundant to Block 2.
+- **Falsification Experiment:** Train F0 vs F2. If F2 does not significantly outperform F0 at 1s-10s windows, we conclude that an explicit frequency branch on 1-6 Hz data is redundant. We would then reserve SincConv exclusively for the **F3 (Broader Preprocessing)** future experiment.
