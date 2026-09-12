@@ -124,3 +124,62 @@ RAW EEG (.mat)                   RAW AUDIO (.wav)
                        |
                   MatchNet (B, 8, T) + (B, 28, T)
 ```
+
+
+# Block 1 — Input & Preprocessing
+
+## 1. Exact Channel Mapping
+- **VERIFIED FROM EEG_training_new (`DATASETS.md`)**
+- The BioSemi64 + EXG setup yields 66 channels in the `.mat` file.
+- Python zero-based indexing is as follows:
+  - 0: Fp1, 1: AF7, 2: AF3, 3: F1, 4: F3, 5: F5, 6: F7, 7: FT7, 8: FC5, 9: FC3, 10: FC1, 11: C1, 12: C3, 13: C5, 14: T7, 15: TP7, 16: CP5, 17: CP3, 18: CP1, 19: P1, 20: P3, 21: P5, 22: P7, 23: P9, 24: PO7, 25: PO3, 26: O1, 27: Iz, 28: Oz, 29: POz, 30: Pz, 31: CPz, 32: Fpz, 33: Fp2, 34: AF8, 35: AF4, 36: AFz, 37: Fz, 38: F2, 39: F4, 40: F6, 41: F8, 42: FT8, 43: FC6, 44: FC4, 45: FC2, 46: FCz, 47: Cz, 48: C2, 49: C4, 50: C6, 51: T8, 52: TP8, 53: CP6, 54: CP4, 55: CP2, 56: P2, 57: P4, 58: P6, 59: P8, 60: P10, 61: PO8, 62: PO4, 63: O2, 64: EXG1, 65: EXG2
+
+## 2. Exact 8-Channel Ordering
+- **CRITICAL FINDING (VERIFIED FROM `train_matchnet_loso.py`)**: The existing MatchNet baseline was trained using Python indices `[13, 46, 43, 23, 50, 0, 52, 14]`.
+- This actually mapped to `[C5, FCz, FC6, P9, C6, Fp1, TP8, T7]`.
+- **The previous documentation (`DATASETS.md`) was completely wrong.** It claimed those indices corresponded to `Fp1, Fp2, F7...`.
+- To use the *actual* proposed spatial channels `[Fp1, Fp2, F7, F8, P7, P8, TP7, TP8]`, the indices MUST be: **`[0, 33, 6, 41, 22, 59, 15, 52]`**.
+
+## 3. Sampling Rate
+- **VERIFIED FROM DATA**: The raw EEG is downsampled from 512 Hz to **64 Hz** in MATLAB.
+- The input to the Python model is strictly 64 Hz.
+
+## 4. Existing Preprocessing
+- **VERIFIED FROM CODE**
+- **MATLAB**:
+  - 50 Hz line-noise removal.
+  - Downsampling (512 Hz -> 64 Hz).
+  - High-pass filter (0.1 Hz).
+  - EOG Regression (VEOG/HEOG).
+  - Common Average Reference (CAR).
+- **Python**:
+  - Channel selection.
+  - Bandpass filtering (1.0 Hz - 6.0 Hz by default).
+
+## 5. Existing Normalization
+- **VERIFIED FROM `train_matchnet_loso.py`**
+- Normalization happens in Python.
+- It is **Per-Channel, Per-Trial Z-score Normalization**.
+- The `normalize_array` function subtracts the mean of the channel over the entire 50s trial and divides by the std of that channel over the trial.
+- Audio (28 bands) is identically normalized (Per-Band, Per-Trial).
+
+## 6. Existing Windowing
+- **VERIFIED FROM `chunk_trial` function**
+- The 50s trial is sliced into overlapping windows.
+- Windows are strictly bounded within a trial (no crossing boundaries).
+- Remainder samples at the end of the trial are discarded.
+- The proposed **1-second input shape** would be exactly `[8, 64]` (8 channels, 64 samples).
+
+## 7. Label/Metadata Attached
+- **VERIFIED FROM CODE**: There is no explicit scalar `1` or `0` label passed to the model.
+- The dataloader yields `(X, Y_A, Y_B)`.
+- `Y_A` is strictly the attended audio envelope.
+- `Y_B` is strictly the unattended audio envelope.
+- The training objective (Contrastive Loss) intrinsically treats `Y_A` as the positive pair.
+
+## 8. Leakage Considerations
+- **VERIFIED AS SAFE**: Normalization statistics are computed *per-trial* before windowing, and trials are entirely independent. Subject separation (LOSO) is fully maintained. There is no leakage of statistics from validation into training.
+
+## 9. Open Questions
+- Do we want to maintain the `[1.0 Hz - 6.0 Hz]` Python bandpass filter for our new 1.0s window, or expand it?
+- Do we want to use the *old* bizarre channels `[C5, FCz...]` to directly compare with the baseline, or use the *intended* `[Fp1, Fp2, F7, F8, P7, P8, TP7, TP8]` channels for the new model?
