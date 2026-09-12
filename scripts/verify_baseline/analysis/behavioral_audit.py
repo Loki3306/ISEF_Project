@@ -132,7 +132,7 @@ def main():
 **Conclusion:** {"Q2 is dominating the correct decisions, proving the contrastive loss relies heavily on distractor rejection." if mean_q2_correct > mean_q1_correct else "Q1 is the dominant strategy, showing the model is primarily learning positive alignment."}
 
 ## 3. Is Q2 responsible for the signed-vs-absolute discrepancy?
-**Analysis:** We correlated the Signed-Absolute Accuracy Gap ($\Delta_{sign}$) with the proportion of overall chunks falling into Q2.
+**Analysis:** We correlated the Signed-Absolute Accuracy Gap ($\Delta_{{sign}}$) with the proportion of overall chunks falling into Q2.
 **Correlation ($r$):** {corr_delta_q2:.3f}
 **Conclusion:** {"There is a strong positive correlation, proving definitively that distractor-rejection is the cause of the massive discrepancy." if corr_delta_q2 > 0.5 else "The correlation is weak, meaning the discrepancy might have other causes."}
 
