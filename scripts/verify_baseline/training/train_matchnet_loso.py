@@ -203,7 +203,7 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                 
     return n_correct, n_total
 
-def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2):
+def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None):
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | MatchNet ({eeg_model}) | Channels: {channels}")
@@ -214,6 +214,9 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
     if not all_paths:
         print("No subjects found.")
         return
+        
+    if subjects_to_run:
+        all_paths = [p for p in all_paths if p.stem in subjects_to_run]
         
     subject_examples = {str(p): load_subject_examples(p) for p in all_paths}
     # ONLY RUN FOLD 1 to save time (we just need one trained model for the inspector)
@@ -408,6 +411,7 @@ if __name__ == "__main__":
     parser.add_argument("--highcut", type=float, default=6.0)
     parser.add_argument("--batch_size", type=int, default=512, help="Training batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="Dataloader num_workers")
+    parser.add_argument("--subjects", type=str, nargs='+', default=None, help="Specific subjects to run (e.g. S2_data_preproc)")
     args = parser.parse_args()
     
-    train_matchnet_loso(args.model, args.channels, args.lowcut, args.highcut, args.batch_size, args.num_workers)
+    train_matchnet_loso(args.model, args.channels, args.lowcut, args.highcut, args.batch_size, args.num_workers, args.subjects)
