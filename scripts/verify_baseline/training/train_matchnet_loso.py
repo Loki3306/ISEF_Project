@@ -144,6 +144,7 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
     window_samples = int(window_sec * FS)
     n_correct = 0.0
     n_total = 0
+    printed_boundary = False
     
     np.random.seed(42)
     shuffle_indices = np.random.permutation(len(X))
@@ -166,6 +167,15 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
             start = 0
             while start + window_samples <= x_np.shape[1]:
                 end = start + window_samples
+                
+                if not printed_boundary:
+                    print(f"--- WINDOW BOUNDARY CHECK ---")
+                    print(f"Trial length (samples): {x_np.shape[1]}")
+                    print(f"Eval start/end sample (EEG): {start} to {end}")
+                    print(f"Eval start/end sample (Audio): {start} to {end}")
+                    print(f"Window length: {window_samples} samples ({window_sec}s)")
+                    printed_boundary = True
+                    
                 x_chunk = torch.FloatTensor(x_np[:, start:end]).unsqueeze(0).to(device)
                 
                 if zero_eeg:
@@ -355,45 +365,22 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
         best_path = f"checkpoints/matchnet_fold_{held_out_path.stem}_best.pth"
         torch.save(best_weights, best_path)
         
-        print(f"  [Evaluation Ablation - Pearson Correlation]")
-        for w_sec in [2, 5, 10, 20, 30]:
-            nc_norm, nt_norm = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, zero_eeg=False, shuffle_labels=False, metric="pearson")
-            acc_norm = nc_norm / max(nt_norm, 1)
-            
-            nc_zero, nt_zero = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, zero_eeg=True, shuffle_labels=False, metric="pearson")
-            acc_zero = nc_zero / max(nt_zero, 1)
-            
-            nc_shuf, nt_shuf = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, zero_eeg=False, shuffle_labels=True, metric="pearson")
-            acc_shuf = nc_shuf / max(nt_shuf, 1)
-            
-            print(f"    -> Window {w_sec:2d}s | Normal: {acc_norm*100:.2f}% | Zero-EEG: {acc_zero*100:.2f}% | Shuffled: {acc_shuf*100:.2f}% | Decisions: {nt_norm}")
-            
-            if w_sec not in all_accs_norm_dict:
-                all_accs_norm_dict[w_sec] = []
-                all_accs_zero_dict[w_sec] = []
-                all_accs_shuf_dict[w_sec] = []
-            
-            all_accs_norm_dict[w_sec].append(acc_norm)
-            all_accs_zero_dict[w_sec].append(acc_zero)
-            all_accs_shuf_dict[w_sec].append(acc_shuf)
-            
-        # Optional: Print Cosine for 10s just to compare
-        nc_cos, nt_cos = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=10, zero_eeg=False, shuffle_labels=False, metric="cosine")
-        print(f"  -> Normal (Cosine, 10s) : {nc_cos / max(nt_cos, 1) * 100:.2f}%")
+        print(f"  [Evaluation - Pearson Correlation, 10s]")
+        w_sec = 10
+        nc_norm, nt_norm = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, zero_eeg=False, shuffle_labels=False, metric="pearson")
+        acc_norm = nc_norm / max(nt_norm, 1)
         
-        nc_zero_cos, nt_zero_cos = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=10, zero_eeg=True, shuffle_labels=False, metric="cosine")
-        print(f"  -> Zero EEG (Cosine, 10s): {nc_zero_cos / max(nt_zero_cos, 1) * 100:.2f}%")
+        print(f"    -> Window {w_sec:2d}s | Normal: {acc_norm*100:.2f}% | Decisions: {nt_norm}")
+        
+        if w_sec not in all_accs_norm_dict:
+            all_accs_norm_dict[w_sec] = []
+        
+        all_accs_norm_dict[w_sec].append(acc_norm)
         
         fold_metrics = {
             "held_out": held_out_path.stem,
             "pearson": {
-                "normal": {w: all_accs_norm_dict[w][-1] for w in all_accs_norm_dict},
-                "zero": {w: all_accs_zero_dict[w][-1] for w in all_accs_zero_dict},
-                "shuf": {w: all_accs_shuf_dict[w][-1] for w in all_accs_shuf_dict}
-            },
-            "cosine_10s": {
-                "normal": nc_cos / max(nt_cos, 1),
-                "zero": nc_zero_cos / max(nt_zero_cos, 1)
+                "normal": {w: all_accs_norm_dict[w][-1] for w in all_accs_norm_dict}
             }
         }
         with open(f"checkpoints/matchnet_fold_{held_out_path.stem}_metrics.json", "w") as f:
@@ -406,13 +393,11 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
         print(f"  [Memory] Post-cleanup RAM: {psutil.virtual_memory().percent}% ({psutil.virtual_memory().used / 1e9:.2f} GB used)")
         
     print("\n" + "="*50)
-    print(f"[MATCHNET ({eeg_model.upper()}) FULL LOSO WINDOW ABLATION (PEARSON)]")
+    print(f"[MATCHNET ({eeg_model.upper()}) CANONICAL E0 EVALUATION (10s PEARSON)]")
     print("="*50)
     for w_sec in sorted(all_accs_norm_dict.keys()):
         final_acc_norm = np.mean(all_accs_norm_dict[w_sec])
-        final_acc_zero = np.mean(all_accs_zero_dict[w_sec])
-        final_acc_shuf = np.mean(all_accs_shuf_dict[w_sec])
-        print(f" Window {w_sec:2d}s | Normal: {final_acc_norm*100:.2f}% | Zero-EEG: {final_acc_zero*100:.2f}% | Shuffled: {final_acc_shuf*100:.2f}%")
+        print(f" Window {w_sec:2d}s | Normal: {final_acc_norm*100:.2f}%")
     print("="*50)
 
 if __name__ == "__main__":

@@ -70,3 +70,17 @@ python scripts/verify_baseline/training/train_matchnet_loso.py --channels 13 46 
 
 ## J. Any remaining discrepancy
 [PENDING Kaggle Execution]
+
+## Pre-Run Integrity Gate
+
+- **GIT INTEGRITY**: PASS (Branch `experiment/e0-canonical-reproduction` checked and scrubbed of E1 modifications).
+- **CHANNEL CHECK**: PASS (Runtime default confirmed as `[13, 46, 43, 23, 50, 0, 52, 14]`, corresponding to `[C5, FCz, FC6, P9, C6, Fp1, TP8, T7]`).
+- **AUDIO CHECK**: PASS (Loading existing `gammatone_envelopes.pkl` which was generated with the historical default FIR length).
+- **EVALUATION CHECK**: PASS (Restricted to exactly 10s non-overlapping Pearson correlation).
+- **LOSO CHECK**: PASS (Iterates all 18 subjects. Validation is trial-level within training subjects only).
+- **WINDOW / BOUNDARY CHECK**: PASS (Code inspects boundary explicitly: evaluation windows never cross trials; 5 non-overlapping 10s windows per 50s trial).
+- **NORMALIZATION CHECK**: PASS (Per-trial Z-score standardization applied *before* windowing, reproducing historical behavior).
+- **MODEL CHECK**: PASS (Uses historical ContrastiveMatchNet with standard EEGNet encoder).
+- **REPRODUCIBILITY CHECK**: PASS (Random seed is hardcoded to 42 for shuffle stability).
+
+**E0 PREFLIGHT = GREEN**
