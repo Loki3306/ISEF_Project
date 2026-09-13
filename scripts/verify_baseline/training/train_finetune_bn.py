@@ -253,7 +253,7 @@ def train_finetune_bn(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52
         print(f"\nFine-tuning BN for: {p.stem}")
         print(f"  [Memory] Pre-fold RAM: {psutil.virtual_memory().percent}% ({psutil.virtual_memory().used / 1e9:.2f} GB used)")
         
-        pretrained_path = REPO_ROOT / pretrained_dir / f"matchnet_fold_{p.stem}_best.pth"
+        pretrained_path = Path(pretrained_dir) / f"matchnet_fold_{p.stem}_best.pth"
         if not pretrained_path.exists():
             print(f"  [Skip] Pretrained LOSO weights not found: {pretrained_path}")
             continue
