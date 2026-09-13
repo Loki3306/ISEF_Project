@@ -276,12 +276,11 @@ def train_matchnet_64ch_loso(eeg_model, lowcut, highcut, batch_size=128, num_wor
         print("No subjects found.")
         return
         
-    if subjects_to_run:
-        all_paths = [p for p in all_paths if p.stem in subjects_to_run]
-        
     subject_examples = {str(p): load_subject_examples(p) for p in all_paths}
-    # ONLY RUN FOLD 1 to save time (we just need one trained model for the inspector)
     folds = list(iter_leave_one_subject_out(all_paths))
+    
+    if subjects_to_run:
+        folds = [f for f in folds if f[0].stem in subjects_to_run]
     
     os.makedirs(REPO_ROOT / "checkpoints", exist_ok=True)
     all_accs_norm_dict = {}
