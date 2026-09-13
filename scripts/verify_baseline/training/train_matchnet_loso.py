@@ -95,15 +95,11 @@ def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, en
             env_a = envelopes[fname_a]
             env_b = envelopes[fname_b]
             
-            # CONFIRMED FIX (audit_eeg_signal.py): DTU convention is
-            # label=1 = "attend left" = wavB; label=2 = "attend right" = wavA.
-            # Y_A is always the ATTENDED envelope; Y_B is UNATTENDED.
-            if ex.label == 1:
-                env_attended = env_b   # attend wavB
-                env_unattended = env_a
-            else:  # label == 2: attend wavA
-                env_attended = env_a
-                env_unattended = env_b
+            # CRITICAL FIX (DATASETS_REFERENCE.md): DTU convention is
+            # wavA is ALWAYS the attended stream. wavB is ALWAYS unattended.
+            # Event labels (1 or 2) indicate speaker gender, NOT attention.
+            env_attended = env_a
+            env_unattended = env_b
         else:
             print(f"Warning: Missing mapping for {sub_key} {trial_key}")
             continue

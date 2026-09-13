@@ -89,16 +89,13 @@ def get_envelopes(ex: TrialExample) -> tuple[np.ndarray, np.ndarray]:
 
 def attended_env(ex: TrialExample) -> np.ndarray:
     """Return the attended envelope.
-    CONFIRMED DTU convention (audit_eeg_signal.py):
-      label=1 = 'attend left' = wavB
-      label=2 = 'attend right' = wavA
+    CRITICAL FIX (DATASETS_REFERENCE.md):
+      In the preprocessed DTU .mat files, wavA is ALWAYS the attended stream.
+      wavB is ALWAYS the unattended stream.
+      Event labels (1 or 2) indicate speaker gender, NOT attention!
     """
-    ea, eb = get_envelopes(ex)
-    if ex.label == 1:
-        return eb   # attend wavB
-    elif ex.label == 2:
-        return ea   # attend wavA
-    raise ValueError(f"Unexpected label: {ex.label}")
+    ea, _ = get_envelopes(ex)
+    return ea
 
 
 # ─── Future-lag EEG matrix (backward model) ────────────────────────────────────
@@ -226,14 +223,12 @@ def eval_windows(
         ca, _ = pearsonr(pred, ea_w)
         cb, _ = pearsonr(pred, eb_w)
 
-        # label=1: attend wavB → correct if cb > ca
-        # label=2: attend wavA → correct if ca > cb
-        if ex.label == 1 and cb > ca:
-            n_correct += 1
-        elif ex.label == 2 and ca > cb:
+        # wavA is ALWAYS attended, wavB is ALWAYS unattended
+        if ca > cb:
             n_correct += 1
 
         n_windows += 1
+
         start += win
 
     return n_correct, n_windows
