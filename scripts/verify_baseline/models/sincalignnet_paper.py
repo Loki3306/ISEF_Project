@@ -116,10 +116,6 @@ class SincAlignEEGEncoder(nn.Module):
             padding=1
         )
         
-        # 3. Downsampling
-        self.pool1 = nn.MaxPool1d(kernel_size=6, stride=6)
-        self.pool2 = nn.MaxPool1d(kernel_size=4, stride=4)
-        
         # 4. Projector (Pointwise Conv to preserve sequence)
         self.projector = nn.Conv1d(32, 64, kernel_size=1)
 
@@ -136,10 +132,7 @@ class SincAlignEEGEncoder(nn.Module):
         x = self.depth_conv(x) # [B, 32, T]
         x = F.relu(x)
         
-        x = self.pool1(x)
-        x = self.pool2(x)
-        
-        x = self.projector(x) # [B, 64, T']
+        x = self.projector(x) # [B, 64, T]
         return x
 
 class SincAlignAudioEncoder(nn.Module):
