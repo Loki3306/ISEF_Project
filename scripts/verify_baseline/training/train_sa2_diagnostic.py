@@ -445,7 +445,7 @@ def train_matchnet_loso(channels, lowcut, highcut, batch_size=128, num_workers=2
         print(f"  [Memory] Post-cleanup RAM: {psutil.virtual_memory().percent}% ({psutil.virtual_memory().used / 1e9:.2f} GB used)")
         
     print("\n" + "="*50)
-    print(f"[MATCHNET ({eeg_model.upper()}) CANONICAL E0 EVALUATION (10s PEARSON)]")
+    print(f"[SA-2 SINC-ALIGN DIAGNOSTIC EVALUATION (10s COSINE)]")
     print("="*50)
     for w_sec in sorted(all_accs_norm_dict.keys()):
         final_acc_norm = np.mean(all_accs_norm_dict[w_sec])
