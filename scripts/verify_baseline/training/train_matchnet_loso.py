@@ -136,7 +136,7 @@ def pearson_corr(x, y, dim=1):
     var_y = (y_centered ** 2).sum(dim=dim)
     return cov / torch.sqrt(var_x * var_y + 1e-8)
 
-def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, shuffle_labels=False, metric="cosine"):
+def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, shuffle_labels=False, metric="cosine", shuffle_eeg_time=False, shuffle_audio_time=False, permute_spatial=False, swap_ab=False):
     """
     Evaluates the model using non-overlapping windows.
     Decision rule: metric(Z_eeg, Z_A) > metric(Z_eeg, Z_B)
@@ -185,6 +185,20 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                 ya_chunk = torch.FloatTensor(ya_np[:, start:end]).unsqueeze(0).to(device)
                 yb_chunk = torch.FloatTensor(yb_np[:, start:end]).unsqueeze(0).to(device)
                 
+                if swap_ab:
+                    ya_chunk, yb_chunk = yb_chunk, ya_chunk
+                    
+                if shuffle_eeg_time:
+                    perm = torch.randperm(x_chunk.shape[-1], device=device)
+                    x_chunk = x_chunk[..., perm]
+                if shuffle_audio_time:
+                    perm = torch.randperm(ya_chunk.shape[-1], device=device)
+                    ya_chunk = ya_chunk[..., perm]
+                    yb_chunk = yb_chunk[..., perm]
+                if permute_spatial:
+                    perm = torch.randperm(x_chunk.shape[1], device=device)
+                    x_chunk = x_chunk[:, perm, :]
+                
                 z_eeg, z_a, z_b = model(x_chunk, ya_chunk, yb_chunk)
                 
                 if metric == "pearson":
@@ -194,10 +208,12 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                     sim_a = F.cosine_similarity(z_eeg, z_a, dim=1).mean().item()
                     sim_b = F.cosine_similarity(z_eeg, z_b, dim=1).mean().item()
                 
-                if sim_a > sim_b:
-                    n_correct += 1.0
-                elif sim_a == sim_b:
-                    n_correct += 0.5
+                if swap_ab:
+                    if sim_b > sim_a: n_correct += 1.0
+                    elif sim_a == sim_b: n_correct += 0.5
+                else:
+                    if sim_a > sim_b: n_correct += 1.0
+                    elif sim_a == sim_b: n_correct += 0.5
                     
                 n_total += 1
                 start += window_samples
@@ -374,10 +390,32 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
         
         print(f"  [Evaluation - Pearson Correlation, 10s]")
         w_sec = 10
-        nc_norm, nt_norm = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, zero_eeg=False, shuffle_labels=False, metric="pearson")
+        
+        nc_norm, nt_norm = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, metric="pearson")
         acc_norm = nc_norm / max(nt_norm, 1)
         
+        nc_zero, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, zero_eeg=True, metric="pearson")
+        acc_zero = nc_zero / max(nt_norm, 1)
+        
+        nc_shuf, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, shuffle_labels=True, metric="pearson")
+        acc_shuf = nc_shuf / max(nt_norm, 1)
+        
+        nc_shuf_eeg_time, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, shuffle_eeg_time=True, metric="pearson")
+        acc_shuf_eeg_time = nc_shuf_eeg_time / max(nt_norm, 1)
+        
+        nc_shuf_audio_time, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, shuffle_audio_time=True, metric="pearson")
+        acc_shuf_audio_time = nc_shuf_audio_time / max(nt_norm, 1)
+        
+        nc_perm_spatial, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, permute_spatial=True, metric="pearson")
+        acc_perm_spatial = nc_perm_spatial / max(nt_norm, 1)
+        
+        nc_swap, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, swap_ab=True, metric="pearson")
+        acc_swap = nc_swap / max(nt_norm, 1)
+        
         print(f"    -> Window {w_sec:2d}s | Normal: {acc_norm*100:.2f}% | Decisions: {nt_norm}")
+        print(f"    -> Controls   | Zero EEG: {acc_zero*100:.2f}% | Shuf Labels: {acc_shuf*100:.2f}%")
+        print(f"    -> Controls   | Shuf EEG Time: {acc_shuf_eeg_time*100:.2f}% | Shuf Audio Time: {acc_shuf_audio_time*100:.2f}%")
+        print(f"    -> Controls   | Permute Spatial: {acc_perm_spatial*100:.2f}% | Swap A/B: {acc_swap*100:.2f}%")
         
         if w_sec not in all_accs_norm_dict:
             all_accs_norm_dict[w_sec] = []
@@ -409,7 +447,7 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Contrastive MatchNet")
-    parser.add_argument("--model", type=str, default="eegnet", choices=["eegnet", "atcnet", "eegnet_s1", "eegnet_s2", "eegnet_multiscale_m2", "sincalignnet"], help="Base EEG encoder")
+    parser.add_argument("--model", type=str, default="eegnet", choices=["eegnet", "atcnet", "eegnet_s1", "eegnet_s2", "eegnet_multiscale_m2", "sincalignnet", "msca"], help="Base EEG encoder")
     parser.add_argument("--channels", type=int, nargs='+', default=[0, 33, 6, 41, 22, 59, 15, 52], help="EEG channel indices to use")
     parser.add_argument("--lowcut", type=float, default=1.0)
     parser.add_argument("--highcut", type=float, default=6.0)
