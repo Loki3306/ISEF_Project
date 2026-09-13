@@ -408,7 +408,7 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Contrastive MatchNet")
-    parser.add_argument("--model", type=str, default="eegnet", choices=["eegnet", "atcnet", "eegnet_s1", "eegnet_s2", "eegnet_multiscale"], help="Base EEG encoder")
+    parser.add_argument("--model", type=str, default="eegnet", choices=["eegnet", "atcnet", "eegnet_s1", "eegnet_s2", "eegnet_multiscale", "eegnet_multiscale_matched"], help="Base EEG encoder")
     parser.add_argument("--channels", type=int, nargs='+', default=[0, 33, 6, 41, 22, 59, 15, 52], help="EEG channel indices to use")
     parser.add_argument("--lowcut", type=float, default=1.0)
     parser.add_argument("--highcut", type=float, default=6.0)
