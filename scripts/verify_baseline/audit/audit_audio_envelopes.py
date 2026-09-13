@@ -135,8 +135,8 @@ def audit_audio_envelopes():
         examples = load_subject_examples(path)
 
         for trial_idx, ex in enumerate(examples):
-            eeg_raw = ex.eeg  # Shape: [n_channels, n_samples_raw]
-            n_samples_raw = eeg_raw.shape[1] if eeg_raw.ndim == 2 else eeg_raw.shape[0]
+            eeg_raw = ex.eeg  # Shape: [n_samples, n_channels] from load_subject_examples
+            n_samples_raw = eeg_raw.shape[0]  # time axis is axis=0
             eeg_duration_at_64hz = int(n_samples_raw * EEG_FS / fs_eeg_raw)
 
             trial_key = f"trial_{trial_idx}"

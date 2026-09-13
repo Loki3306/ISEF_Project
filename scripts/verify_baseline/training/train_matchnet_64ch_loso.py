@@ -92,8 +92,17 @@ def prepare_dataset(examples, lowcut, highcut, subject_id, mapping, envelopes):
             fname_a = mapping[sub_key][trial_key]["wavA"]["filename"]
             fname_b = mapping[sub_key][trial_key]["wavB"]["filename"]
             
-            env_attended = envelopes[fname_a] 
-            env_unattended = envelopes[fname_b] 
+            env_a = envelopes[fname_a]
+            env_b = envelopes[fname_b]
+            
+            # CRITICAL FIX: label=1 means attend to wavA, label=2 means attend to wavB.
+            # Y_A must always be the ATTENDED envelope; Y_B the UNATTENDED.
+            if ex.label == 1:
+                env_attended = env_a
+                env_unattended = env_b
+            else:  # label == 2: attend B
+                env_attended = env_b
+                env_unattended = env_a
         else:
             print(f"Warning: Missing mapping for {sub_key} {trial_key}")
             continue
