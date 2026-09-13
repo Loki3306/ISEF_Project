@@ -177,7 +177,7 @@ def eval_windows(
 
 # ─── LOSO mode ────────────────────────────────────────────────────────────────
 
-def run_loso() -> list[dict]:
+def run_loso(subjects_filter: list[str] | None = None, pilot: bool = False) -> list[dict]:
     print(f"\n{'='*70}")
     print("RIDGE AAD — LEAVE-ONE-SUBJECT-OUT (LOSO)")
     print(f"{'='*70}")
@@ -186,16 +186,27 @@ def run_loso() -> list[dict]:
     print(f"  Lambda:      {RIDGE_LAMBDA}")
     print(f"  Envelope:    Hilbert + LP {LOWPASS_HZ}Hz + compression {COMPRESSION}")
     print(f"  Windows:     {WINDOW_SIZES_S}s")
+    if pilot:
+        print(f"  MODE:        PILOT (1 fold only)")
+    if subjects_filter:
+        print(f"  Subjects:    {subjects_filter}")
     print()
 
     paths = subject_files()
+    if subjects_filter:
+        paths = [p for p in paths if p.stem in subjects_filter]
     all_examples = {str(p): load_subject_examples(p) for p in paths}
 
     rows = []
     # Per-window-size accumulators across all held-out subjects
     totals = {w: {"n_correct": 0, "n_total": 0} for w in WINDOW_SIZES_S}
 
-    for held_out_path, train_paths in iter_leave_one_subject_out(paths):
+    folds = list(iter_leave_one_subject_out(paths))
+    if pilot:
+        folds = folds[:1]
+        print(f"  (Pilot mode: running only 1 fold — {folds[0][0].stem})")
+
+    for held_out_path, train_paths in folds:
         held_out_id = held_out_path.stem
         train_exs: list[TrialExample] = []
         for p in train_paths:
@@ -290,12 +301,21 @@ def run_loso() -> list[dict]:
 
 # ─── Within-Subject mode ──────────────────────────────────────────────────────
 
-def run_within() -> list[dict]:
+def run_within(subjects_filter: list[str] | None = None, pilot: bool = False) -> list[dict]:
     print(f"\n{'='*70}")
     print(f"RIDGE AAD — WITHIN-SUBJECT ({WITHIN_SUBJECT_FOLDS}-FOLD CV PER SUBJECT)")
     print(f"{'='*70}")
+    if pilot:
+        print(f"  MODE: PILOT (1 subject only)")
+    if subjects_filter:
+        print(f"  Subjects: {subjects_filter}")
 
     paths = subject_files()
+    if subjects_filter:
+        paths = [p for p in paths if p.stem in subjects_filter]
+    if pilot:
+        paths = paths[:1]
+        print(f"  (Pilot mode: running only subject {paths[0].stem})")
     all_examples = {str(p): load_subject_examples(p) for p in paths}
 
     rows = []
@@ -406,16 +426,24 @@ def run_within() -> list[dict]:
 def main():
     parser = argparse.ArgumentParser(description="Ridge AAD baseline — LOSO and within-subject")
     parser.add_argument("--mode", choices=["loso", "within", "both"], default="both")
+    parser.add_argument(
+        "--subjects", nargs="+", default=None,
+        help="Limit to specific subject stems, e.g. S5_data_preproc S6_data_preproc"
+    )
+    parser.add_argument(
+        "--pilot", action="store_true",
+        help="Smoke-test mode: run only 1 fold/subject to verify the pipeline before full run"
+    )
     args = parser.parse_args()
 
     all_rows: list[dict] = []
 
     if args.mode in ("loso", "both"):
-        rows = run_loso()
+        rows = run_loso(subjects_filter=args.subjects, pilot=args.pilot)
         all_rows.extend(rows)
 
     if args.mode in ("within", "both"):
-        rows = run_within()
+        rows = run_within(subjects_filter=args.subjects, pilot=args.pilot)
         all_rows.extend(rows)
 
     if all_rows:
