@@ -74,7 +74,7 @@ def get_mapping_data():
         envelopes = pickle.load(f)
     return mapping, envelopes
 
-def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, envelopes):
+def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, envelopes, exclude_audio_files=None):
     X = []
     Y_A = []
     Y_B = []
@@ -82,15 +82,14 @@ def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, en
     sub_key = subject_id.replace("_data_preproc", "")
     
     for i, ex in enumerate(examples):
-        eeg = ex.eeg[:, channels].T
-        eeg = butter_bandpass_filter(eeg, lowcut, highcut, FS, axis=1)
-        x_norm = normalize_array(eeg.T).T 
-        
         trial_key = f"trial_{i}"
         
         if sub_key in mapping and trial_key in mapping[sub_key]:
             fname_a = mapping[sub_key][trial_key]["wavA"]["filename"]
             fname_b = mapping[sub_key][trial_key]["wavB"]["filename"]
+            
+            if exclude_audio_files is not None and (fname_a in exclude_audio_files or fname_b in exclude_audio_files):
+                continue
             
             env_a = envelopes[fname_a]
             env_b = envelopes[fname_b]
@@ -103,6 +102,10 @@ def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, en
         else:
             print(f"Warning: Missing mapping for {sub_key} {trial_key}")
             continue
+            
+        eeg = ex.eeg[:, channels].T
+        eeg = butter_bandpass_filter(eeg, lowcut, highcut, FS, axis=1)
+        x_norm = normalize_array(eeg.T).T 
             
         min_len = min(x_norm.shape[1], env_attended.shape[1])
         x_norm = x_norm[:, :min_len]
@@ -230,7 +233,7 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                 
     return n_correct, n_total
 
-def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False, use_dann=False, use_temporal_transport=False):
+def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False, use_dann=False, use_temporal_transport=False, file_disjoint=False):
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | MatchNet ({eeg_model}) | Channels: {channels}")
@@ -285,10 +288,21 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
                 print(f"Audio Tensor Shape: {batch_ya.shape}")
                 print(f"Audio Mean: {batch_ya.mean().item():.4f}, Std: {batch_ya.std().item():.4f}")
             print("--- 2. EXECUTING FULL LOSO ---")
+            
+        held_out_audio_files = None
+        if file_disjoint:
+            held_out_audio_files = set()
+            sub_key_test = held_out_path.stem.replace("_data_preproc", "")
+            if sub_key_test in mapping:
+                for trial in mapping[sub_key_test].values():
+                    held_out_audio_files.add(trial['wavA']['filename'])
+                    held_out_audio_files.add(trial['wavB']['filename'])
+            print(f"  [File-Disjoint] Filtering out {len(held_out_audio_files)} audio files used by {sub_key_test} from training...")
+            
         X_tr_full, YA_tr_full, YB_tr_full = [], [], []
         for p in train_paths:
             if str(p) in [e.subject for e in val_exs]: continue # Skip validation mixing roughly
-            tX, tYA, tYB = prepare_dataset(subject_examples[str(p)], channels, lowcut, highcut, p.stem, mapping, envelopes)
+            tX, tYA, tYB = prepare_dataset(subject_examples[str(p)], channels, lowcut, highcut, p.stem, mapping, envelopes, exclude_audio_files=held_out_audio_files)
             X_tr_full.extend(tX); YA_tr_full.extend(tYA); YB_tr_full.extend(tYB)
             
         X_tr_full, YA_tr_full, YB_tr_full, Subj_tr_full = [], [], [], []
@@ -555,6 +569,7 @@ if __name__ == "__main__":
     parser.add_argument("--augment_sign_flip", action="store_true", help="Randomly flip EEG sign during training to enforce phase-invariance")
     parser.add_argument("--use_dann", action="store_true", help="Use Domain Adversarial Neural Network to enforce subject invariance")
     parser.add_argument("--use_temporal_transport", action="store_true", help="Enable Neural Temporal Deformation Field (Strategy 1) to biologically warp audio delays")
+    parser.add_argument("--file_disjoint", action="store_true", help="Enforce strictly disjoint audio files between train and test sets")
     args = parser.parse_args()
     
     train_matchnet_loso(
@@ -570,5 +585,6 @@ if __name__ == "__main__":
         align_target=args.align_target,
         augment_sign_flip=args.augment_sign_flip,
         use_dann=args.use_dann,
-        use_temporal_transport=args.use_temporal_transport
+        use_temporal_transport=args.use_temporal_transport,
+        file_disjoint=args.file_disjoint
     )
