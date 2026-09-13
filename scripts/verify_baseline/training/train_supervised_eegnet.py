@@ -186,7 +186,8 @@ def train_supervised_loso(lowcut, highcut, batch_size=128, num_workers=2, subjec
         )
             
         # Model
-        model = EEGNet_Classifier(in_channels=64).to(device)
+        num_channels = X_tr_full[0].shape[0]
+        model = EEGNet_Classifier(in_channels=num_channels).to(device)
         optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
         scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
         criterion = nn.BCEWithLogitsLoss()
