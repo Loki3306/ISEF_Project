@@ -265,7 +265,7 @@ def train_finetune_bn(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52
         np.random.seed(42)
         indices = np.random.permutation(n_trials)
         
-        test_split = int(0.2 * n_trials)
+        test_split = int(0.1 * n_trials)
         val_split = int(0.1 * n_trials)
         
         test_idx = indices[:test_split]
@@ -334,7 +334,7 @@ def train_finetune_bn(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52
         trainable_params = 0
         frozen_params = 0
         for name, param in model.named_parameters():
-            if "bn" in name.lower() or "norm" in name.lower():
+            if "bn" in name.lower() or "batchnorm" in name.lower():
                 param.requires_grad = True
                 trainable_params += param.numel()
             else:
@@ -344,7 +344,7 @@ def train_finetune_bn(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52
         print(f"  [Freezing] Trainable Params (BN): {trainable_params:,} | Frozen Params: {frozen_params:,}")
 
         # Note: we pass ONLY the parameters that require gradients to the optimizer
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-4)
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-4, weight_decay=1e-4)
         scaler = torch.cuda.amp.GradScaler()
         
         best_val_acc = 0.0
@@ -355,7 +355,15 @@ def train_finetune_bn(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52
         print(f"Training on {len(X_tr)} chunks ({TRAIN_WINDOW_SEC}s) | Batch Size: {batch_size} | Workers: {num_workers}...")
         
         for epoch in range(25):
-            model.train()
+            # Mathematically correct BN Fine-Tuning:
+            # 1. Set entire model to eval() to DISABLE Dropout and lock stochastic behavior
+            model.eval()
+            
+            # 2. Set ONLY BatchNorm layers to train() so they update their running mean/var stats on the target subject
+            for module in model.modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    module.train()
+                    
             train_loss = 0.0
             train_sa = 0.0
             train_sb = 0.0
