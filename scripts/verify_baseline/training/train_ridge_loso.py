@@ -79,12 +79,16 @@ def get_envelopes(ex: TrialExample) -> tuple[np.ndarray, np.ndarray]:
 
 
 def attended_env(ex: TrialExample) -> np.ndarray:
-    """Return the attended envelope. label=1 → A, label=2 → B."""
+    """Return the attended envelope.
+    CONFIRMED DTU convention (audit_eeg_signal.py):
+      label=1 = 'attend left' = wavB
+      label=2 = 'attend right' = wavA
+    """
     env_a, env_b = get_envelopes(ex)
     if ex.label == 1:
-        return env_a
+        return env_b   # attend wavB
     elif ex.label == 2:
-        return env_b
+        return env_a   # attend wavA
     raise ValueError(f"Unexpected label: {ex.label}")
 
 
@@ -167,9 +171,11 @@ def eval_windows(
         ca, _ = pearsonr(pred, ea_w)
         cb, _ = pearsonr(pred, eb_w)
 
-        if ex.label == 1 and ca > cb:
+        # label=1: attend wavB → correct if cb > ca
+        # label=2: attend wavA → correct if ca > cb
+        if ex.label == 1 and cb > ca:   # attend wavB
             n_correct += 1
-        elif ex.label == 2 and cb > ca:
+        elif ex.label == 2 and ca > cb:  # attend wavA
             n_correct += 1
 
         n_windows += 1

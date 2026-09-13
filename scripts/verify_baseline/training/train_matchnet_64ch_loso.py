@@ -95,14 +95,15 @@ def prepare_dataset(examples, lowcut, highcut, subject_id, mapping, envelopes):
             env_a = envelopes[fname_a]
             env_b = envelopes[fname_b]
             
-            # CRITICAL FIX: label=1 means attend to wavA, label=2 means attend to wavB.
-            # Y_A must always be the ATTENDED envelope; Y_B the UNATTENDED.
+            # CONFIRMED FIX (audit_eeg_signal.py): DTU convention is
+            # label=1 = "attend left" = wavB; label=2 = "attend right" = wavA.
+            # Y_A is always the ATTENDED envelope; Y_B is UNATTENDED.
             if ex.label == 1:
+                env_attended = env_b   # attend wavB
+                env_unattended = env_a
+            else:  # label == 2: attend wavA
                 env_attended = env_a
                 env_unattended = env_b
-            else:  # label == 2: attend B
-                env_attended = env_b
-                env_unattended = env_a
         else:
             print(f"Warning: Missing mapping for {sub_key} {trial_key}")
             continue
