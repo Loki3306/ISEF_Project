@@ -9,7 +9,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[0]
 sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(REPO_ROOT.parent.parent)) # to get models/
 
 from models.matchnet import ContrastiveMatchNet
 from baselines.ridge_aad import load_subject_examples, subject_files
