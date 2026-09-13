@@ -230,7 +230,7 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                 
     return n_correct, n_total
 
-def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False, use_dann=False):
+def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False, use_dann=False, use_temporal_transport=False):
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | MatchNet ({eeg_model}) | Channels: {channels}")
@@ -345,7 +345,7 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
             
         # Model
         num_subjects = len(train_paths)
-        model = ContrastiveMatchNet(eeg_model_type=eeg_model, eeg_channels=len(channels), audio_channels=NUM_BANDS, latent_dim=64, num_subjects=num_subjects).to(device)
+        model = ContrastiveMatchNet(eeg_model_type=eeg_model, eeg_channels=len(channels), audio_channels=NUM_BANDS, latent_dim=64, num_subjects=num_subjects, use_temporal_transport=use_temporal_transport).to(device)
         optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
         scaler = torch.cuda.amp.GradScaler()
         
@@ -358,9 +358,8 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
         
         for epoch in range(100):
             model.train()
-            train_loss = 0.0
-            train_sa = 0.0
-            train_sb = 0.0
+            train_loss, train_sa, train_sb = 0.0, 0.0, 0.0
+            train_loss_delay, train_loss_smooth, train_loss_mono, train_jac_min = 0.0, 0.0, 0.0, 0.0
             
             # Update GRL lambda for this epoch
             if use_dann:
@@ -388,10 +387,15 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
                 
                 optimizer.zero_grad()
                 with torch.cuda.amp.autocast():
-                    if use_dann:
+                    if use_dann and use_temporal_transport:
+                        z_eeg, z_a, z_b, subj_logits, (delta_t_a, delta_t_b) = model(bx, bya, byb, return_subject_logits=True, return_deltas=True)
+                    elif use_dann:
                         z_eeg, z_a, z_b, subj_logits = model(bx, bya, byb, return_subject_logits=True)
+                    elif use_temporal_transport:
+                        z_eeg, z_a, z_b, (delta_t_a, delta_t_b) = model(bx, bya, byb, return_deltas=True)
                     else:
                         z_eeg, z_a, z_b = model(bx, bya, byb)
+                        
                     if loss_type == "anchored":
                         loss, sa, sb = anchored_contrastive_loss(z_eeg, z_a, z_b, margin=0.1, lambda_align=lambda_align, align_target=align_target)
                     elif loss_type == "absolute":
@@ -414,6 +418,29 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
                     if use_dann:
                         loss_subj = F.cross_entropy(subj_logits, b_subj)
                         loss = loss + loss_subj
+                        
+                    if use_temporal_transport:
+                        # delta_t_a and delta_t_b are now in PHYSICAL SECONDS
+                        loss_delay = (delta_t_a ** 2).mean() + (delta_t_b ** 2).mean()
+                        
+                        # Smoothness penalty
+                        loss_smooth = ((delta_t_a[:, :, 1:] - delta_t_a[:, :, :-1]) ** 2).mean() + \
+                                      ((delta_t_b[:, :, 1:] - delta_t_b[:, :, :-1]) ** 2).mean()
+                                      
+                        # Monotonicity penalty (Strategy 1.7)
+                        dt = 1.0 / 64.0
+                        mono_a = F.relu(-(dt + delta_t_a[:, :, 1:] - delta_t_a[:, :, :-1]))
+                        mono_b = F.relu(-(dt + delta_t_b[:, :, 1:] - delta_t_b[:, :, :-1]))
+                        loss_mono = (mono_a ** 2).mean() + (mono_b ** 2).mean()
+                        
+                        # Regularization weights for NTDF
+                        loss = loss + (1.0 * loss_delay) + (10.0 * loss_smooth) + (100.0 * loss_mono)
+                        
+                        train_loss_delay += loss_delay.item()
+                        train_loss_smooth += loss_smooth.item()
+                        train_loss_mono += loss_mono.item()
+                        r_t = 1.0 + 64.0 * (delta_t_a[:, :, 1:] - delta_t_a[:, :, :-1])
+                        train_jac_min += r_t.min().item()
                 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -438,7 +465,11 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
             avg_sa = train_sa / num_batches
             avg_sb = train_sb / num_batches
             
-            print(f"  Epoch {epoch+1:02d}/100 | Loss: {avg_loss:.4f} (sA: {avg_sa:.3f}, sB: {avg_sb:.3f}) | Val Acc: {val_acc*100:.2f}% | Patience: {epochs_no_improve}/10")
+            log_str = f"  Epoch {epoch+1:02d}/100 | Loss: {avg_loss:.4f} (sA: {avg_sa:.3f}, sB: {avg_sb:.3f}) | Val Acc: {val_acc*100:.2f}%"
+            if use_temporal_transport:
+                log_str += f" | NTDF[D:{train_loss_delay/num_batches:.4f} S:{train_loss_smooth/num_batches:.4f} M:{train_loss_mono/num_batches:.4f} Jac:{train_jac_min/num_batches:.3f}]"
+            log_str += f" | Patience: {epochs_no_improve}/10"
+            print(log_str)
                 
             if epochs_no_improve >= patience:
                 break
@@ -523,6 +554,21 @@ if __name__ == "__main__":
     parser.add_argument("--align_target", type=float, default=0.1, help="Positive alignment target for anchored loss")
     parser.add_argument("--augment_sign_flip", action="store_true", help="Randomly flip EEG sign during training to enforce phase-invariance")
     parser.add_argument("--use_dann", action="store_true", help="Use Domain Adversarial Neural Network to enforce subject invariance")
+    parser.add_argument("--use_temporal_transport", action="store_true", help="Enable Neural Temporal Deformation Field (Strategy 1) to biologically warp audio delays")
     args = parser.parse_args()
     
-    train_matchnet_loso(args.model, args.channels, args.lowcut, args.highcut, args.batch_size, args.num_workers, args.subjects, args.loss, args.lambda_align, args.align_target, args.augment_sign_flip, args.use_dann)
+    train_matchnet_loso(
+        eeg_model=args.model,
+        channels=args.channels,
+        lowcut=args.lowcut,
+        highcut=args.highcut,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        subjects_to_run=args.subjects,
+        loss_type=args.loss,
+        lambda_align=args.lambda_align,
+        align_target=args.align_target,
+        augment_sign_flip=args.augment_sign_flip,
+        use_dann=args.use_dann,
+        use_temporal_transport=args.use_temporal_transport
+    )

@@ -35,12 +35,79 @@ def _compute_mean_cosine_similarity(z_1, z_2):
     sim = F.cosine_similarity(z_1, z_2, dim=1)
     return sim.mean(dim=1)
 
+class TemporalDeformationField(nn.Module):
+    """
+    1D Spatial Transformer Network to biologically align EEG and Audio.
+    Learns a local temporal deformation field delta_t in [-1, 1].
+    """
+    def __init__(self, channels=64, max_shift_ms=500, fs=64.0):
+        super().__init__()
+        self.max_shift_seconds = max_shift_ms / 1000.0
+        self.fs = fs
+        
+        # Lightweight CNN to predict delay field
+        # Removed groups=channels to allow full cross-channel mixing
+        self.align_net = nn.Sequential(
+            nn.Conv1d(channels * 2, channels // 2, kernel_size=15, padding=7),
+            nn.BatchNorm1d(channels // 2),
+            nn.GELU(),
+            nn.Conv1d(channels // 2, 1, kernel_size=1)
+        )
+        
+        # Initialize the final layer to predict 0 shift at the start of training
+        nn.init.zeros_(self.align_net[-1].weight)
+        nn.init.zeros_(self.align_net[-1].bias)
+        
+    def forward(self, z_eeg, z_audio):
+        B, C, T = z_eeg.shape
+        
+        # 1. Predict delay field in physical seconds
+        concat_feats = torch.cat([z_eeg, z_audio], dim=1) # [B, 2C, T]
+        raw_delta = self.align_net(concat_feats) # [B, 1, T]
+        
+        # Explicit unit conversion
+        delta_seconds = self.max_shift_seconds * torch.tanh(raw_delta) # Bounded to [-max, +max]
+        delta_samples = delta_seconds * self.fs
+        
+        # Convert delta to normalized grid coordinate shift
+        # 2 / (T - 1) is the width of 1 sample in normalized coordinates [-1, 1]
+        sample_width = 2.0 / (T - 1)
+        normalized_shift = delta_samples * sample_width
+        
+        # 2. Create base grid
+        base_grid = torch.linspace(-1, 1, T, device=z_eeg.device)
+        base_grid = base_grid.view(1, 1, T).expand(B, 1, T)
+        
+        # Add shift to base grid
+        shifted_grid_x = base_grid + normalized_shift # [B, 1, T]
+        shifted_grid_y = torch.zeros_like(shifted_grid_x)
+        
+        # Stack into grid: [B, 1, T, 2]
+        grid = torch.stack([shifted_grid_x, shifted_grid_y], dim=-1)
+        
+        # 3. Warp Audio
+        z_audio_4d = z_audio.unsqueeze(2) # [B, C, 1, T]
+        z_audio_warped = F.grid_sample(
+            z_audio_4d, 
+            grid, 
+            mode='bilinear', 
+            padding_mode='border', 
+            align_corners=True
+        )
+        z_audio_warped = z_audio_warped.squeeze(2) # [B, C, T]
+        
+        return z_audio_warped, delta_seconds
+
 class ContrastiveMatchNet(nn.Module):
     """
     A Siamese network that explicitly learns a matching function between EEG and Audio.
     """
-    def __init__(self, eeg_model_type="eegnet", eeg_channels=8, audio_channels=28, latent_dim=64, num_subjects=17):
+    def __init__(self, eeg_model_type="eegnet", eeg_channels=8, audio_channels=28, latent_dim=64, num_subjects=17, use_temporal_transport=False):
         super().__init__()
+        
+        self.use_temporal_transport = use_temporal_transport
+        if self.use_temporal_transport:
+            self.tdf = TemporalDeformationField(channels=latent_dim)
         
         # 1. EEG Encoder
         if eeg_model_type.lower() == "eegnet":
@@ -90,14 +157,7 @@ class ContrastiveMatchNet(nn.Module):
             from models.msca_modules import GradientReversalLayer
             self.grl = GradientReversalLayer(lambda_=0.0)
         except ImportError:
-            # Fallback if not running in the right directory context
-            class _GRLFallback(nn.Module):
-                def __init__(self, lambda_=0.0):
-                    super().__init__()
-                    self.lambda_ = lambda_
-                def forward(self, x):
-                    return x # DANN won't work in this fallback
-            self.grl = _GRLFallback(lambda_=0.0)
+            self.grl = GradientReversalLayer(lambda_=0.0)
             
         self.subject_classifier = nn.Sequential(
             nn.Linear(latent_dim, latent_dim // 2),
@@ -116,7 +176,7 @@ class ContrastiveMatchNet(nn.Module):
         """ Returns [B, latent_dim, Time] """
         return self.audio_encoder(audio)
 
-    def forward(self, eeg, audio_a, audio_b, return_subject_logits=False):
+    def forward(self, eeg, audio_a, audio_b=None, return_subject_logits=False, return_deltas=False):
         """
         Forward pass for training.
         eeg: [B, C, T]
@@ -127,15 +187,26 @@ class ContrastiveMatchNet(nn.Module):
         """
         z_eeg = self.encode_eeg(eeg)
         z_a = self.encode_audio(audio_a)
-        z_b = self.encode_audio(audio_b)
+        z_b = self.encode_audio(audio_b) if audio_b is not None else None
+        
+        delta_t_a, delta_t_b = None, None
+        if hasattr(self, 'use_temporal_transport') and self.use_temporal_transport:
+            z_a, delta_t_a = self.tdf(z_eeg, z_a)
+            if z_b is not None:
+                z_b, delta_t_b = self.tdf(z_eeg, z_b)
+                
+        # Return Tuple formatting
+        out = (z_eeg, z_a, z_b)
         
         if return_subject_logits:
             z_pool = z_eeg.mean(dim=-1)
             subj_feat = self.grl(z_pool)
             subj_logits = self.subject_classifier(subj_feat)
-            return z_eeg, z_a, z_b, subj_logits
+            out = out + (subj_logits,)
+        if return_deltas:
+            out = out + ((delta_t_a, delta_t_b),)
             
-        return z_eeg, z_a, z_b
+        return out
 
     def compute_similarities(self, z_eeg, z_a, z_b):
         """Shared similarity computation path."""
