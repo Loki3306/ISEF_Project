@@ -78,7 +78,7 @@ class ContrastiveMatchNet(nn.Module):
         elif eeg_model_type.lower() == "msca":
             from models.msca_eeg_encoder import MSCA_EEGEncoder
             self.eeg_encoder = MSCA_EEGEncoder(in_channels=eeg_channels)
-            self.eeg_encoder.output_proj = nn.Conv1d(16, latent_dim, kernel_size=1)
+            self.eeg_encoder.output_proj = nn.Conv1d(64, latent_dim, kernel_size=1)
         else:
             raise ValueError(f"Unknown eeg_model_type: {eeg_model_type}")
             
