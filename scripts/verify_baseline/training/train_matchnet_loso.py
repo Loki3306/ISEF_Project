@@ -230,7 +230,7 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                 
     return n_correct, n_total
 
-def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1):
+def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False):
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | MatchNet ({eeg_model}) | Channels: {channels}")
@@ -353,6 +353,13 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
                 bya = bya.to(device, non_blocking=True)
                 byb = byb.to(device, non_blocking=True)
                 
+                # Random Sign Flipping Augmentation
+                if augment_sign_flip:
+                    # Randomly multiply the entire EEG chunk by -1 (50% chance per batch element)
+                    # Shape of bx: (B, C, T)
+                    sign = torch.randint(0, 2, (bx.size(0), 1, 1), device=device).float() * 2.0 - 1.0
+                    bx = bx * sign
+                
                 optimizer.zero_grad()
                 with torch.cuda.amp.autocast():
                     z_eeg, z_a, z_b = model(bx, bya, byb)
@@ -474,6 +481,7 @@ if __name__ == "__main__":
     parser.add_argument("--loss", type=str, default="contrastive", choices=["contrastive", "anchored", "absolute"], help="Loss function")
     parser.add_argument("--lambda_align", type=float, default=0.5, help="Weight for alignment penalty in anchored loss")
     parser.add_argument("--align_target", type=float, default=0.1, help="Positive alignment target for anchored loss")
+    parser.add_argument("--augment_sign_flip", action="store_true", help="Randomly flip EEG sign during training to enforce phase-invariance")
     args = parser.parse_args()
     
-    train_matchnet_loso(args.model, args.channels, args.lowcut, args.highcut, args.batch_size, args.num_workers, args.subjects, args.loss, args.lambda_align, args.align_target)
+    train_matchnet_loso(args.model, args.channels, args.lowcut, args.highcut, args.batch_size, args.num_workers, args.subjects, args.loss, args.lambda_align, args.align_target, args.augment_sign_flip)
