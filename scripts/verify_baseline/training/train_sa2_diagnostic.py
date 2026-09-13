@@ -18,7 +18,8 @@ from torch.utils.data import TensorDataset, DataLoader
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from models.sa2_matchnet import SA2MatchNet, infonce_vector_loss
+from models.sa2_matchnet import SA2MatchNet
+from models.matchnet import infonce_loss
 from baselines.ridge_aad import load_subject_examples, subject_files, iter_leave_one_subject_out
 
 FS = 64
@@ -76,8 +77,8 @@ def get_mapping_data():
 
 def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, envelopes):
     X = []
-    Y_A = []
-    Y_B = []
+    Y_A = []  # Will now strictly hold ATTENDED audio
+    Y_B = []  # Will now strictly hold UNATTENDED audio
     
     sub_key = subject_id.replace("_data_preproc", "")
     
@@ -91,23 +92,35 @@ def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, en
         if sub_key in mapping and trial_key in mapping[sub_key]:
             fname_a = mapping[sub_key][trial_key]["wavA"]["filename"]
             fname_b = mapping[sub_key][trial_key]["wavB"]["filename"]
+            
             env_a_full = envelopes[fname_a] 
             env_b_full = envelopes[fname_b] 
+            
+            # ex.label is 1 if A is attended, 2 if B is attended
+            if ex.label == 1:
+                env_attended = env_a_full
+                env_unattended = env_b_full
+            elif ex.label == 2:
+                env_attended = env_b_full
+                env_unattended = env_a_full
+            else:
+                print(f"Warning: Unknown label {ex.label} for {sub_key} {trial_key}")
+                continue
         else:
             print(f"Warning: Missing mapping for {sub_key} {trial_key}")
             continue
             
-        min_len = min(x_norm.shape[1], env_a_full.shape[1])
+        min_len = min(x_norm.shape[1], env_attended.shape[1])
         x_norm = x_norm[:, :min_len]
-        env_a = env_a_full[:, :min_len]
-        env_b = env_b_full[:, :min_len]
+        env_attended = env_attended[:, :min_len]
+        env_unattended = env_unattended[:, :min_len]
         
-        env_a = normalize_array(env_a.T).T
-        env_b = normalize_array(env_b.T).T
+        env_attended = normalize_array(env_attended.T).T
+        env_unattended = normalize_array(env_unattended.T).T
         
         X.append(x_norm)
-        Y_A.append(env_a)
-        Y_B.append(env_b)
+        Y_A.append(env_attended)
+        Y_B.append(env_unattended)
         
     return X, Y_A, Y_B
 
@@ -138,7 +151,7 @@ def pearson_corr(x, y, dim=1):
 def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, shuffle_labels=False, metric="cosine"):
     """
     Evaluates the SA-2 model using non-overlapping windows.
-    Decision rule: cosine(Z_eeg, Z_A) > cosine(Z_eeg, Z_B)
+    Decision rule: pearson(Z_eeg, Z_A) > pearson(Z_eeg, Z_B)
     """
     model.eval()
     window_samples = int(window_sec * FS)
@@ -183,28 +196,11 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                 ya_chunk_10s = torch.FloatTensor(ya_np[:, start:end]).unsqueeze(0).to(device)
                 yb_chunk_10s = torch.FloatTensor(yb_np[:, start:end]).unsqueeze(0).to(device)
                 
-                # SA2MatchNet requires fixed 5s inputs (due to flattening). We split the 10s window into two 5s sub-chunks.
-                sub_len = int(5 * FS)
-                if x_chunk_10s.shape[2] == sub_len * 2:
-                    c1_x, c2_x = torch.split(x_chunk_10s, sub_len, dim=2)
-                    c1_ya, c2_ya = torch.split(ya_chunk_10s, sub_len, dim=2)
-                    c1_yb, c2_yb = torch.split(yb_chunk_10s, sub_len, dim=2)
-                    
-                    z_eeg1, z_a1, z_b1 = model(c1_x, c1_ya, c1_yb)
-                    z_eeg2, z_a2, z_b2 = model(c2_x, c2_ya, c2_yb)
-                    
-                    sim_a1 = F.cosine_similarity(z_eeg1, z_a1, dim=1).item()
-                    sim_b1 = F.cosine_similarity(z_eeg1, z_b1, dim=1).item()
-                    sim_a2 = F.cosine_similarity(z_eeg2, z_a2, dim=1).item()
-                    sim_b2 = F.cosine_similarity(z_eeg2, z_b2, dim=1).item()
-                    
-                    sim_a = (sim_a1 + sim_a2) / 2.0
-                    sim_b = (sim_b1 + sim_b2) / 2.0
-                else:
-                    # Fallback (e.g., if window_sec is exactly 5)
-                    z_eeg, z_a, z_b = model(x_chunk_10s, ya_chunk_10s, yb_chunk_10s)
-                    sim_a = F.cosine_similarity(z_eeg, z_a, dim=1).item()
-                    sim_b = F.cosine_similarity(z_eeg, z_b, dim=1).item()
+                z_eeg, z_a, z_b = model(x_chunk_10s, ya_chunk_10s, yb_chunk_10s)
+                
+                # Use mean Pearson Correlation over the temporal sequence for evaluation
+                sim_a = pearson_corr(z_eeg, z_a, dim=1).mean().item()
+                sim_b = pearson_corr(z_eeg, z_b, dim=1).mean().item()
                 
                 if sim_a > sim_b:
                     n_correct += 1.0
@@ -339,8 +335,9 @@ def train_matchnet_loso(channels, lowcut, highcut, batch_size=128, num_workers=2
             
         print("Sinc Cutoff Frequencies (Before Training):")
         with torch.no_grad():
-            f1 = torch.abs(model.eeg_encoder.sinc_conv.f1).cpu().numpy() * FS
-            band = torch.abs(model.eeg_encoder.sinc_conv.band).cpu().numpy() * FS
+            f1, f2, band = model.eeg_encoder.sinc_conv.get_bands()
+            f1 = f1.cpu().numpy() * FS
+            band = band.cpu().numpy() * FS
             print(f"f1: {f1[:5]} ...")
             print(f"band: {band[:5]} ...")
         print("---------------------------------------\n")
@@ -369,7 +366,7 @@ def train_matchnet_loso(channels, lowcut, highcut, batch_size=128, num_workers=2
                 optimizer.zero_grad()
                 with torch.cuda.amp.autocast():
                     z_eeg, z_a, z_b = model(bx, bya, byb)
-                    loss, sa, sb = infonce_vector_loss(z_eeg, z_a, z_b, temperature=0.1)
+                    loss, sa, sb = infonce_loss(z_eeg, z_a, z_b, temperature=0.1)
                 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -409,17 +406,17 @@ def train_matchnet_loso(channels, lowcut, highcut, batch_size=128, num_workers=2
         torch.save(best_weights, best_path)
         print("\nSinc Cutoff Frequencies (After Training):")
         with torch.no_grad():
-            f1 = torch.abs(model.eeg_encoder.sinc_conv.f1).cpu().numpy() * FS
-            band = torch.abs(model.eeg_encoder.sinc_conv.band).cpu().numpy() * FS
+            f1, f2, band = model.eeg_encoder.sinc_conv.get_bands()
+            f1 = f1.cpu().numpy() * FS
+            band = band.cpu().numpy() * FS
             print(f"f1: {f1[:5]} ...")
             print(f"band: {band[:5]} ...")
         print("---------------------------------------\n")
         
-        print(f"  [Evaluation - Vector Cosine, 10s]")
+        print(f"  [Evaluation - Sequence Pearson, 10s]")
         w_sec = 10
         
-        # Remove the comment blocks that I accidentally left
-        nc_norm, nt_norm = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, zero_eeg=False, shuffle_labels=False, metric="cosine")
+        nc_norm, nt_norm = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, zero_eeg=False, shuffle_labels=False, metric="pearson")
         acc_norm = nc_norm / max(nt_norm, 1)
         
         print(f"    -> Window {w_sec:2d}s | Normal: {acc_norm*100:.2f}% | Decisions: {nt_norm}")
@@ -431,7 +428,7 @@ def train_matchnet_loso(channels, lowcut, highcut, batch_size=128, num_workers=2
         
         fold_metrics = {
             "held_out": held_out_path.stem,
-            "cosine_10s": {
+            "pearson_10s": {
                 "normal": {w: all_accs_norm_dict[w][-1] for w in all_accs_norm_dict}
             }
         }
@@ -445,7 +442,7 @@ def train_matchnet_loso(channels, lowcut, highcut, batch_size=128, num_workers=2
         print(f"  [Memory] Post-cleanup RAM: {psutil.virtual_memory().percent}% ({psutil.virtual_memory().used / 1e9:.2f} GB used)")
         
     print("\n" + "="*50)
-    print(f"[SA-2 SINC-ALIGN DIAGNOSTIC EVALUATION (10s COSINE)]")
+    print(f"[SA-2 SINC-ALIGN DIAGNOSTIC EVALUATION (10s PEARSON)]")
     print("="*50)
     for w_sec in sorted(all_accs_norm_dict.keys()):
         final_acc_norm = np.mean(all_accs_norm_dict[w_sec])

@@ -76,8 +76,8 @@ def get_mapping_data():
 
 def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, envelopes):
     X = []
-    Y_A = []
-    Y_B = []
+    Y_A = []  # Will now strictly hold ATTENDED audio
+    Y_B = []  # Will now strictly hold UNATTENDED audio
     
     sub_key = subject_id.replace("_data_preproc", "")
     
@@ -91,23 +91,35 @@ def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, en
         if sub_key in mapping and trial_key in mapping[sub_key]:
             fname_a = mapping[sub_key][trial_key]["wavA"]["filename"]
             fname_b = mapping[sub_key][trial_key]["wavB"]["filename"]
+            
             env_a_full = envelopes[fname_a] 
             env_b_full = envelopes[fname_b] 
+            
+            # ex.label is 1 if A is attended, 2 if B is attended
+            if ex.label == 1:
+                env_attended = env_a_full
+                env_unattended = env_b_full
+            elif ex.label == 2:
+                env_attended = env_b_full
+                env_unattended = env_a_full
+            else:
+                print(f"Warning: Unknown label {ex.label} for {sub_key} {trial_key}")
+                continue
         else:
             print(f"Warning: Missing mapping for {sub_key} {trial_key}")
             continue
             
-        min_len = min(x_norm.shape[1], env_a_full.shape[1])
+        min_len = min(x_norm.shape[1], env_attended.shape[1])
         x_norm = x_norm[:, :min_len]
-        env_a = env_a_full[:, :min_len]
-        env_b = env_b_full[:, :min_len]
+        env_attended = env_attended[:, :min_len]
+        env_unattended = env_unattended[:, :min_len]
         
-        env_a = normalize_array(env_a.T).T
-        env_b = normalize_array(env_b.T).T
+        env_attended = normalize_array(env_attended.T).T
+        env_unattended = normalize_array(env_unattended.T).T
         
         X.append(x_norm)
-        Y_A.append(env_a)
-        Y_B.append(env_b)
+        Y_A.append(env_attended)
+        Y_B.append(env_unattended)
         
     return X, Y_A, Y_B
 

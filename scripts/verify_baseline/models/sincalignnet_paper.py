@@ -6,7 +6,8 @@ import numpy as np
 
 class SincConv1d(nn.Module):
     """
-    Sinc-based 1D convolution parameterized by cutoff frequencies.
+    Sinc-based 1D convolution parameterized by cutoff frequencies, 
+    with rigorous mathematical bounds preventing Nyquist violation.
     """
     def __init__(self, out_channels, kernel_size, sample_rate, min_low_hz, min_band_hz, in_channels=1, stride=1, padding=0):
         super(SincConv1d, self).__init__()
@@ -14,50 +15,58 @@ class SincConv1d(nn.Module):
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         
-        # Ensure kernel size is odd
         if kernel_size % 2 == 0:
             self.kernel_size = kernel_size + 1
             
         self.stride = stride
         self.padding = padding
         self.sample_rate = sample_rate
+        
+        self.nyquist = sample_rate / 2.0
+        self.min_low_hz = min_low_hz
+        self.min_band_hz = min_band_hz
 
-        # Initialize cutoffs linearly
-        hz = np.linspace(min_low_hz, sample_rate / 2, out_channels + 1)
+        hz = torch.linspace(min_low_hz, self.nyquist - min_band_hz, out_channels + 1)
+        f1_init = hz[:-1]
         
-        f1 = hz[:-1]
-        f2 = hz[1:]
+        f1_norm = (f1_init - self.min_low_hz) / (self.nyquist - self.min_low_hz - self.min_band_hz + 1e-6)
+        f1_norm = torch.clamp(f1_norm, 1e-4, 1.0 - 1e-4)
+        f1_raw_init = torch.log(f1_norm / (1 - f1_norm))
         
-        # Enforce minimum band constraints on initialization
-        band_hz = f2 - f1
-        band_hz = np.maximum(band_hz, min_band_hz)
-        f2 = f1 + band_hz
+        band_init = min_band_hz + 1.0
+        band_norm = (band_init - self.min_band_hz) / (self.nyquist - f1_init - self.min_band_hz + 1e-6)
+        band_norm = torch.clamp(band_norm, 1e-4, 1.0 - 1e-4)
+        band_raw_init = torch.log(band_norm / (1 - band_norm))
         
-        # Normalize to [0, 1] (Nyquist = 0.5)
-        f1 = f1 / sample_rate
-        f2 = f2 / sample_rate
-        
-        self.f1 = nn.Parameter(torch.Tensor(f1))
-        self.band = nn.Parameter(torch.Tensor(f2 - f1))
+        self.f1_raw = nn.Parameter(f1_raw_init)
+        self.band_raw = nn.Parameter(band_raw_init)
 
-        # Create window function (Hamming window)
         n = torch.linspace(0, self.kernel_size - 1, self.kernel_size)
         window = 0.54 - 0.46 * torch.cos(2 * math.pi * n / (self.kernel_size - 1))
         self.register_buffer('window', window)
 
-        # Create time axis
         t_right = torch.linspace(1, (self.kernel_size - 1) / 2, steps=int((self.kernel_size - 1) / 2))
         self.register_buffer('t_right', t_right)
-
-    def forward(self, x):
-        """
-        x: [B, 1, C, T] (for EEG) or [B, 1, 1, T] (for Audio)
-        """
-        f1 = torch.abs(self.f1)
-        band = torch.abs(self.band)
+        
+    def get_bands(self):
+        range_f1 = self.nyquist - self.min_low_hz - self.min_band_hz
+        f1 = self.min_low_hz + range_f1 * torch.sigmoid(self.f1_raw)
+        
+        range_band = self.nyquist - f1 - self.min_band_hz
+        band = self.min_band_hz + range_band * torch.sigmoid(self.band_raw)
+        
         f2 = f1 + band
         
-        # Sinc function: sin(2*pi*f*t) / (pi*t)
+        # Normalize for math (Hz -> [0, 0.5])
+        f1_norm = f1 / self.sample_rate
+        f2_norm = f2 / self.sample_rate
+        band_norm = band / self.sample_rate
+        
+        return f1_norm, f2_norm, band_norm
+
+    def forward(self, x):
+        f1, f2, band = self.get_bands()
+        
         t = self.t_right
         
         f1_2pi_t = 2 * math.pi * f1.view(-1, 1) * t.view(1, -1)
@@ -67,18 +76,12 @@ class SincConv1d(nn.Module):
         low_pass2 = torch.sin(f2_2pi_t) / (math.pi * t.view(1, -1))
         
         band_pass_right = low_pass2 - low_pass1
-        
-        # Center of filter (t=0): 2 * (f2 - f1)
         band_pass_center = 2 * band.view(-1, 1)
         
-        # Combine left, center, right
         band_pass_left = torch.flip(band_pass_right, dims=[1])
         band_pass = torch.cat([band_pass_left, band_pass_center, band_pass_right], dim=1)
         
-        # Apply window
         band_pass = band_pass * self.window.view(1, -1)
-        
-        # Reshape to [out_channels, 1, 1, kernel_size] for Conv2d
         filters = band_pass.view(self.out_channels, 1, 1, self.kernel_size)
         
         return F.conv2d(x, filters, stride=self.stride, padding=self.padding)
@@ -117,21 +120,8 @@ class SincAlignEEGEncoder(nn.Module):
         self.pool1 = nn.MaxPool1d(kernel_size=6, stride=6)
         self.pool2 = nn.MaxPool1d(kernel_size=4, stride=4)
         
-        # Calculate flattened dimension dynamically
-        # Conv1d padding=1 keeps T. 
-        # Pool1: T // 6
-        # Pool2: (T // 6) // 4
-        pooled_T = (seq_len // 6) // 4
-        flattened_dim = 32 * pooled_T
-        
-        # 4. Projector (Linear Layers)
-        self.projector = nn.Sequential(
-            nn.Linear(flattened_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128)
-        )
+        # 4. Projector (Pointwise Conv to preserve sequence)
+        self.projector = nn.Conv1d(32, 64, kernel_size=1)
 
     def forward(self, x):
         # x: [B, C, T]
@@ -149,9 +139,7 @@ class SincAlignEEGEncoder(nn.Module):
         x = self.pool1(x)
         x = self.pool2(x)
         
-        x = x.view(B, -1) # Flatten
-        
-        x = self.projector(x) # [B, 128]
+        x = self.projector(x) # [B, 64, T']
         return x
 
 class SincAlignAudioEncoder(nn.Module):
@@ -182,16 +170,7 @@ class SincAlignAudioEncoder(nn.Module):
         self.pool1 = nn.MaxPool1d(kernel_size=6, stride=6)
         self.pool2 = nn.MaxPool1d(kernel_size=4, stride=4)
         
-        pooled_T = (seq_len // 6) // 4
-        flattened_dim = 32 * pooled_T
-        
-        self.projector = nn.Sequential(
-            nn.Linear(flattened_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128)
-        )
+        self.projector = nn.Conv1d(32, 64, kernel_size=1)
 
     def forward(self, x):
         # x: [B, 1, T]
@@ -207,9 +186,7 @@ class SincAlignAudioEncoder(nn.Module):
         x = self.pool1(x)
         x = self.pool2(x)
         
-        x = x.view(B, -1) # Flatten
-        
-        x = self.projector(x) # [B, 128]
+        x = self.projector(x) # [B, 64, T']
         return x
 
 if __name__ == "__main__":
