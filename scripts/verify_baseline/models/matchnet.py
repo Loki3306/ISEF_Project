@@ -226,42 +226,47 @@ def infonce_loss(z_eeg, z_a, z_b, temperature=0.1):
         
     return loss, sim_a_diag, sim_b_diag
 
-def dcca_loss(H1, H2, r1=1e-3, r2=1e-3, eps=1e-9):
+def dcca_loss(H1, H2, lambda_decorr=0.1, eps=1e-9):
     """
-    Computes the Deep Canonical Correlation Analysis (DCCA) loss between two views.
-    H1, H2: tensors of shape [Batch * T, Features] or [Batch, Features]
+    Computes a Coordinate-Aligned Deep Canonical Correlation Analysis (DCCA) loss.
+    This is mathematically similar to Barlow Twins/VICReg, ensuring that the 
+    representations are not just correlated under some arbitrary linear projection,
+    but explicitly aligned coordinate-by-coordinate. This matches the evaluation
+    metric which computes coordinate-wise Pearson correlation.
+    
+    H1, H2: tensors of shape [Batch * T, Features]
     """
     # 1. Mean center the batches
     H1_mean = H1 - H1.mean(dim=0, keepdim=True)
     H2_mean = H2 - H2.mean(dim=0, keepdim=True)
     
-    batch_size = H1.size(0)
+    # 2. Normalize by standard deviation (variance = 1)
+    H1_std = torch.sqrt(H1_mean.var(dim=0) + eps)
+    H2_std = torch.sqrt(H2_mean.var(dim=0) + eps)
     
-    # 2. Compute covariance matrices
-    SigmaHat12 = (1.0 / (batch_size - 1)) * torch.matmul(H1_mean.t(), H2_mean)
-    SigmaHat11 = (1.0 / (batch_size - 1)) * torch.matmul(H1_mean.t(), H1_mean) + r1 * torch.eye(H1.size(1), device=H1.device)
-    SigmaHat22 = (1.0 / (batch_size - 1)) * torch.matmul(H2_mean.t(), H2_mean) + r2 * torch.eye(H2.size(1), device=H2.device)
+    Z1 = H1_mean / H1_std
+    Z2 = H2_mean / H2_std
     
-    # 3. Compute inverse square roots using robust eigenvalue decomposition
-    D1, V1 = torch.linalg.eigh(SigmaHat11)
-    D1 = torch.clamp(D1, min=eps)
-    SigmaHat11RootInv = torch.matmul(torch.matmul(V1, torch.diag(D1 ** -0.5)), V1.t())
+    batch_size = Z1.size(0)
     
-    D2, V2 = torch.linalg.eigh(SigmaHat22)
-    D2 = torch.clamp(D2, min=eps)
-    SigmaHat22RootInv = torch.matmul(torch.matmul(V2, torch.diag(D2 ** -0.5)), V2.t())
+    # 3. Compute cross-correlation matrix (should be Identity)
+    C = (Z1.t() @ Z2) / (batch_size - 1)
     
-    # 4. Compute T = Σ11^{-1/2} Σ12 Σ22^{-1/2}
-    T_matrix = torch.matmul(torch.matmul(SigmaHat11RootInv, SigmaHat12), SigmaHat22RootInv)
+    # 4. Maximize correlation on the diagonal (Coordinate-wise alignment)
+    diag_corr = torch.diagonal(C)
+    invariance_loss = -diag_corr.mean()
     
-    # 5. Compute CCA objective: sum of singular values of T
-    # Use svdvals for gradient stability
-    svdvals = torch.linalg.svdvals(T_matrix)
+    # 5. Decorrelate off-diagonal elements (Prevent representational collapse)
+    # We penalize the off-diagonal elements of the auto-correlation matrices
+    C1 = (Z1.t() @ Z1) / (batch_size - 1)
+    C2 = (Z2.t() @ Z2) / (batch_size - 1)
     
-    # Loss is the negative sum of canonical correlations
-    loss = -torch.sum(svdvals)
+    mask = ~torch.eye(C1.size(0), dtype=torch.bool, device=C1.device)
+    decorr_loss = (C1[mask] ** 2).mean() + (C2[mask] ** 2).mean()
     
-    return loss, svdvals.mean(), svdvals.mean()
+    loss = invariance_loss + lambda_decorr * decorr_loss
+    
+    return loss, diag_corr.mean(), diag_corr.mean()
 
 if __name__ == "__main__":
     model = ContrastiveMatchNet("eegnet")
