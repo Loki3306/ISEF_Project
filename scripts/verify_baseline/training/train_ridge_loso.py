@@ -144,50 +144,43 @@ def n_features(n_channels: int) -> int:
 
 # ─── Ridge fitting ─────────────────────────────────────────────────────────────
 
+import torch
+
 def fit_ridge(
     examples: list[TrialExample],
     *,
     ridge_lambda: float = RIDGE_LAMBDA,
 ) -> np.ndarray:
     """Fit Ridge: EEG_future_lagged → attended_envelope."""
-    print(f"      [Ridge] Fitting model over {len(examples)} trials (batched XtX)...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"      [Ridge] Fitting model over {len(examples)} trials using {str(device).upper()}...")
     
     n_feat = n_features(examples[0].eeg.shape[1])
-    XtX = np.zeros((n_feat, n_feat), dtype=np.float64)
-    Xty = np.zeros(n_feat, dtype=np.float64)
-
-    BATCH_SIZE = 50
-    X_batch = []
-    y_batch = []
-    
-    def process_batch():
-        if not X_batch: return
-        Xb = np.vstack(X_batch)
-        yb = np.concatenate(y_batch)
-        XtX[:] += Xb.T @ Xb
-        Xty[:] += Xb.T @ yb
-        X_batch.clear()
-        y_batch.clear()
+    # Allocate running accumulators directly on GPU
+    XtX = torch.zeros((n_feat, n_feat), dtype=torch.float64, device=device)
+    Xty = torch.zeros(n_feat, dtype=torch.float64, device=device)
 
     for i, ex in enumerate(examples):
         X_trial = future_lagged_eeg(ex.eeg)
         y_trial = attended_env(ex)
         n = min(X_trial.shape[0], len(y_trial))
         
-        X_batch.append(X_trial[:n])
-        y_batch.append(y_trial[:n])
+        # Transfer just this trial to GPU (instantly calculated, then discarded)
+        X_pt = torch.from_numpy(X_trial[:n]).to(device=device, dtype=torch.float64)
+        y_pt = torch.from_numpy(y_trial[:n]).to(device=device, dtype=torch.float64)
         
-        if len(X_batch) >= BATCH_SIZE:
-            print(f"      [Ridge] Processed batch up to {i+1}/{len(examples)} trials...")
-            process_batch()
-            
-    # Process remaining
-    if X_batch:
-        print(f"      [Ridge] Processing final batch...")
-        process_batch()
+        XtX += X_pt.T @ X_pt
+        Xty += X_pt.T @ y_pt
+        
+        if i % 100 == 0 and i > 0:
+            print(f"      [Ridge] Processed {i}/{len(examples)} trials on GPU...")
 
-    print("      [Ridge] Solving linear system...")
-    return np.linalg.solve(XtX + ridge_lambda * np.eye(n_feat), Xty)
+    print("      [Ridge] Solving linear system on GPU...")
+    XtX += ridge_lambda * torch.eye(n_feat, dtype=torch.float64, device=device)
+    
+    # Solve system on GPU and pull weights back to CPU numpy array
+    w = torch.linalg.solve(XtX, Xty)
+    return w.cpu().numpy()
 
 
 def predict_envelope(X: np.ndarray, weights: np.ndarray) -> np.ndarray:
