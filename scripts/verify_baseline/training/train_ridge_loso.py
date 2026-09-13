@@ -150,26 +150,26 @@ def fit_ridge(
     ridge_lambda: float = RIDGE_LAMBDA,
 ) -> np.ndarray:
     """Fit Ridge: EEG_future_lagged → attended_envelope."""
-    print(f"      [Ridge] Precomputing features for {len(examples)} trials...")
-    X_list = []
-    y_list = []
+    print(f"      [Ridge] Fitting model over {len(examples)} trials (incremental XtX)...")
+    
+    # We must build XtX incrementally to avoid OOM (1020 trials = 28GB of RAM if concatenated!)
+    n_feat = n_features(examples[0].eeg.shape[1])
+    XtX = np.zeros((n_feat, n_feat), dtype=np.float64)
+    Xty = np.zeros(n_feat, dtype=np.float64)
 
-    for ex in examples:
+    for i, ex in enumerate(examples):
+        if i % 100 == 0 and i > 0:
+            print(f"      [Ridge] Processed {i}/{len(examples)} trials...")
+            
         X_trial = future_lagged_eeg(ex.eeg)
         y_trial = attended_env(ex)
         n = min(X_trial.shape[0], len(y_trial))
-        X_list.append(X_trial[:n])
-        y_list.append(y_trial[:n])
-
-    print("      [Ridge] Concatenating matrices...")
-    X_all = np.vstack(X_list)
-    y_all = np.concatenate(y_list)
-
-    n_feat = X_all.shape[1]
-    
-    print(f"      [Ridge] Computing XtX and Xty for shape {X_all.shape}...")
-    XtX = X_all.T @ X_all
-    Xty = X_all.T @ y_all
+        
+        X = X_trial[:n]
+        y = y_trial[:n]
+        
+        XtX += X.T @ X
+        Xty += X.T @ y
 
     print("      [Ridge] Solving linear system...")
     return np.linalg.solve(XtX + ridge_lambda * np.eye(n_feat), Xty)
