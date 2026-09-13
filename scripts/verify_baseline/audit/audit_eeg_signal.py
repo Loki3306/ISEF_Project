@@ -90,90 +90,119 @@ def run():
     print(f"\n{'='*70}")
     print("EEG-SPEECH SIGNAL DIAGNOSTIC")
     print(f"Subjects: {TEST_SUBJECTS}")
-    print(f"Lags: {LAG_MS_RANGE[0]}ms to {LAG_MS_RANGE[-1]}ms")
     print(f"{'='*70}\n")
 
-    # Accumulators: lag → list of (r_att - r_unatt) per trial per channel
-    lag_delta_wav   = {l: [] for l in LAG_MS_RANGE}
-    lag_delta_gamma = {l: [] for l in LAG_MS_RANGE}
+    # Accumulators — normal AND inverted labels
+    lag_delta_wav_norm = {l: [] for l in LAG_MS_RANGE}
+    lag_delta_wav_inv  = {l: [] for l in LAG_MS_RANGE}
+    lag_delta_gam_norm = {l: [] for l in LAG_MS_RANGE}
+
+    wav_a_vals, wav_b_vals = [], []   # for statistics check
 
     for path in paths:
         sid = path.stem
         subj_key = sid.split("_")[0]
         exs = load_subject_examples(path)
-
         print(f"Subject: {sid} ({len(exs)} trials)")
 
         for ex in exs:
-            eeg = ex.eeg  # [n_samples, 66]
+            eeg = ex.eeg   # [n_samples, 66]
+            env_a = normalize(ex.wav_a)
+            env_b = normalize(ex.wav_b)
+            wav_a_vals.append(ex.wav_a.ravel())
+            wav_b_vals.append(ex.wav_b.ravel())
 
-            # ── Source 1: wavA/wavB directly from MAT ──
-            env_a_wav = normalize(ex.wav_a)
-            env_b_wav = normalize(ex.wav_b)
-
-            # ── Source 2: gammatone pkl (broadband mean) ──
-            env_a_gamma = env_b_gamma = None
+            # gammatone broadband
+            ga = gb = None
             if envelopes and mapping:
-                trial_key = f"trial_{ex.trial_index}"
-                if subj_key in mapping and trial_key in mapping[subj_key]:
-                    fa = mapping[subj_key][trial_key].get("wavA", {}).get("filename")
-                    fb = mapping[subj_key][trial_key].get("wavB", {}).get("filename")
+                tk = f"trial_{ex.trial_index}"
+                if subj_key in mapping and tk in mapping[subj_key]:
+                    fa = mapping[subj_key][tk].get("wavA", {}).get("filename")
+                    fb = mapping[subj_key][tk].get("wavB", {}).get("filename")
                     if fa in envelopes and fb in envelopes:
-                        # Mean across 28 gammatone bands → broadband envelope
-                        env_a_gamma = normalize(envelopes[fa].mean(axis=0))
-                        env_b_gamma = normalize(envelopes[fb].mean(axis=0))
+                        ga = normalize(envelopes[fa].mean(axis=0))
+                        gb = normalize(envelopes[fb].mean(axis=0))
 
-            # Attended / unattended assignment
+            # NORMAL label convention: label=1 → attend wavA
             if ex.label == 1:
-                att_wav, unatt_wav = env_a_wav, env_b_wav
-                att_gamma, unatt_gamma = env_a_gamma, env_b_gamma
+                att, unatt = env_a, env_b
+                gatt, gunatt = ga, gb
             else:
-                att_wav, unatt_wav = env_b_wav, env_a_wav
-                att_gamma, unatt_gamma = env_b_gamma, env_a_gamma
+                att, unatt = env_b, env_a
+                gatt, gunatt = gb, ga
 
-            n = eeg.shape[0]
-            min_len = min(n, len(att_wav))
+            # INVERTED label convention: label=1 → attend wavB
+            if ex.label == 1:
+                att_inv, unatt_inv = env_b, env_a
+            else:
+                att_inv, unatt_inv = env_a, env_b
 
-            # Average over temporal channels (best channels for AAD tracking)
-            eeg_mean = eeg[:min_len, TEMPORAL_CHANNELS].mean(axis=1)
+            n = min(eeg.shape[0], len(att))
+            # Mean over all scalp channels (simple average)
+            eeg_mean = eeg[:n, :64].mean(axis=1)
 
             for lag_ms in LAG_MS_RANGE:
-                r_att = pearson_lag(eeg_mean, att_wav[:min_len], lag_ms)
-                r_un  = pearson_lag(eeg_mean, unatt_wav[:min_len], lag_ms)
-                if not (np.isnan(r_att) or np.isnan(r_un)):
-                    lag_delta_wav[lag_ms].append(r_att - r_un)
+                rn  = pearson_lag(eeg_mean, att[:n], lag_ms)
+                run = pearson_lag(eeg_mean, unatt[:n], lag_ms)
+                ri  = pearson_lag(eeg_mean, att_inv[:n], lag_ms)
+                rin = pearson_lag(eeg_mean, unatt_inv[:n], lag_ms)
 
-                if att_gamma is not None:
-                    min_g = min(min_len, len(att_gamma))
-                    r_att_g = pearson_lag(eeg_mean, att_gamma[:min_g], lag_ms)
-                    r_un_g  = pearson_lag(eeg_mean, unatt_gamma[:min_g], lag_ms)
-                    if not (np.isnan(r_att_g) or np.isnan(r_un_g)):
-                        lag_delta_gamma[lag_ms].append(r_att_g - r_un_g)
+                if not (np.isnan(rn) or np.isnan(run)):
+                    lag_delta_wav_norm[lag_ms].append(rn - run)
+                if not (np.isnan(ri) or np.isnan(rin)):
+                    lag_delta_wav_inv[lag_ms].append(ri - rin)
 
-    # ── Print results ──
-    print(f"\n{'lag_ms':>8} | {'Δr (wavA-MAT)':>14} | {'Δr (gammatone)':>16}")
-    print("-" * 45)
-    best_wav = best_gamma = (-999, 0)
+                if gatt is not None:
+                    ng = min(n, len(gatt))
+                    rg  = pearson_lag(eeg_mean, gatt[:ng], lag_ms)
+                    rgu = pearson_lag(eeg_mean, gunatt[:ng], lag_ms)
+                    if not (np.isnan(rg) or np.isnan(rgu)):
+                        lag_delta_gam_norm[lag_ms].append(rg - rgu)
+
+    # ── wavA/wavB statistics ──────────────────────────────────────────────────
+    all_wav_a = np.concatenate(wav_a_vals)
+    all_wav_b = np.concatenate(wav_b_vals)
+    print(f"\n── wavA stats (raw):  mean={all_wav_a.mean():.4f}  std={all_wav_a.std():.4f}  "
+          f"min={all_wav_a.min():.4f}  max={all_wav_a.max():.4f}")
+    print(f"── wavB stats (raw):  mean={all_wav_b.mean():.4f}  std={all_wav_b.std():.4f}  "
+          f"min={all_wav_b.min():.4f}  max={all_wav_b.max():.4f}")
+    corr_ab, _ = pearsonr(all_wav_a[:10000], all_wav_b[:10000])
+    print(f"── Corr(wavA, wavB) (first 10k samples):  r={corr_ab:.4f}")
+    print()
+
+    # ── Correlation table ─────────────────────────────────────────────────────
+    print(f"{'lag_ms':>8} | {'Δr NORMAL':>12} | {'Δr INVERTED':>13} | {'Δr GAMMA':>10}")
+    print("-" * 55)
+    best_norm  = (-999, 0)
+    best_inv   = (-999, 0)
+    best_gam   = (-999, 0)
     for lag_ms in LAG_MS_RANGE:
-        dw = np.mean(lag_delta_wav[lag_ms]) if lag_delta_wav[lag_ms] else float("nan")
-        dg = np.mean(lag_delta_gamma[lag_ms]) if lag_delta_gamma[lag_ms] else float("nan")
-        print(f"{int(lag_ms):>8} | {dw:>14.5f} | {dg:>16.5f}")
-        if not np.isnan(dw) and dw > best_wav[0]: best_wav = (dw, lag_ms)
-        if not np.isnan(dg) and dg > best_gamma[0]: best_gamma = (dg, lag_ms)
+        dn  = np.mean(lag_delta_wav_norm[lag_ms]) if lag_delta_wav_norm[lag_ms] else float("nan")
+        di  = np.mean(lag_delta_wav_inv[lag_ms])  if lag_delta_wav_inv[lag_ms]  else float("nan")
+        dg  = np.mean(lag_delta_gam_norm[lag_ms]) if lag_delta_gam_norm[lag_ms] else float("nan")
+        print(f"{int(lag_ms):>8} | {dn:>12.5f} | {di:>13.5f} | {dg:>10.5f}")
+        if not np.isnan(dn) and dn > best_norm[0]: best_norm = (dn, lag_ms)
+        if not np.isnan(di) and di > best_inv[0]:  best_inv  = (di, lag_ms)
+        if not np.isnan(dg) and dg > best_gam[0]:  best_gam  = (dg, lag_ms)
 
-    print(f"\nBest Δr (wavA-MAT):    {best_wav[0]:.5f} at lag {best_wav[1]}ms")
-    print(f"Best Δr (gammatone):   {best_gamma[0]:.5f} at lag {best_gamma[1]}ms")
+    print(f"\nBest Δr (NORMAL labels):    {best_norm[0]:.5f}  at {best_norm[1]}ms")
+    print(f"Best Δr (INVERTED labels):  {best_inv[0]:.5f}  at {best_inv[1]}ms")
+    print(f"Best Δr (gammatone):        {best_gam[0]:.5f}  at {best_gam[1]}ms")
 
+    # ── Verdict ───────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print("INTERPRETATION")
+    print("VERDICT")
     print(f"{'='*70}")
-    for name, (best_dr, _) in [("wavA-MAT", best_wav), ("gammatone", best_gamma)]:
-        if best_dr > 0.02:
-            print(f"  {name}: SIGNAL PRESENT (Δr={best_dr:.4f})")
-        elif best_dr > 0.005:
-            print(f"  {name}: WEAK SIGNAL (Δr={best_dr:.4f})")
-        else:
-            print(f"  {name}: NO SIGNAL (Δr={best_dr:.4f}) — investigate data!")
+    if best_inv[0] > 0.005 and best_inv[0] > best_norm[0]:
+        print("  *** LABEL INVERSION CONFIRMED ***")
+        print(f"  Inverted labels give Δr={best_inv[0]:.4f} vs Normal Δr={best_norm[0]:.4f}")
+        print("  FIX: swap att/unatt convention — label=1 means attend wavB, not wavA")
+    elif best_norm[0] > 0.005:
+        print(f"  Signal present with NORMAL labels (Δr={best_norm[0]:.4f})")
+        print("  Labels are correct. Check Ridge bandwidth / preprocessing.")
+    else:
+        print(f"  No signal in either direction. Best Δr={max(best_norm[0],best_inv[0]):.5f}")
+        print("  Data may be misaligned or EEG may be missing the AAD frequency band.")
     print(f"{'='*70}\n")
 
 
