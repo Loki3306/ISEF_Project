@@ -76,8 +76,8 @@ def get_mapping_data():
 
 def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, envelopes):
     X = []
-    Y_A = []  # Will now strictly hold ATTENDED audio
-    Y_B = []  # Will now strictly hold UNATTENDED audio
+    Y_A = []
+    Y_B = []
     
     sub_key = subject_id.replace("_data_preproc", "")
     
@@ -92,19 +92,8 @@ def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, en
             fname_a = mapping[sub_key][trial_key]["wavA"]["filename"]
             fname_b = mapping[sub_key][trial_key]["wavB"]["filename"]
             
-            env_a_full = envelopes[fname_a] 
-            env_b_full = envelopes[fname_b] 
-            
-            # ex.label is 1 if A is attended, 2 if B is attended
-            if ex.label == 1:
-                env_attended = env_a_full
-                env_unattended = env_b_full
-            elif ex.label == 2:
-                env_attended = env_b_full
-                env_unattended = env_a_full
-            else:
-                print(f"Warning: Unknown label {ex.label} for {sub_key} {trial_key}")
-                continue
+            env_attended = envelopes[fname_a] 
+            env_unattended = envelopes[fname_b] 
         else:
             print(f"Warning: Missing mapping for {sub_key} {trial_key}")
             continue
