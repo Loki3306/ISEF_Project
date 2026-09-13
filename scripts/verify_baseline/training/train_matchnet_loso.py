@@ -142,7 +142,7 @@ def pearson_corr(x, y, dim=1):
     var_y = (y_centered ** 2).sum(dim=dim)
     return cov / torch.sqrt(var_x * var_y + 1e-8)
 
-def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, shuffle_labels=False, metric="cosine", shuffle_eeg_time=False, shuffle_audio_time=False, permute_spatial=False, swap_ab=False):
+def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, shuffle_labels=False, metric="cosine", shuffle_eeg_time=False, shuffle_audio_time=False, permute_spatial=False, swap_ab=False, use_absolute_scoring=False):
     """
     Evaluates the model using non-overlapping windows.
     Decision rule: metric(Z_eeg, Z_A) > metric(Z_eeg, Z_B)
@@ -213,6 +213,10 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                 else:
                     sim_a = F.cosine_similarity(z_eeg, z_a, dim=1).mean().item()
                     sim_b = F.cosine_similarity(z_eeg, z_b, dim=1).mean().item()
+                
+                if use_absolute_scoring:
+                    sim_a = abs(sim_a)
+                    sim_b = abs(sim_b)
                 
                 if swap_ab:
                     if sim_b > sim_a: n_correct += 1.0
@@ -354,6 +358,13 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
                     z_eeg, z_a, z_b = model(bx, bya, byb)
                     if loss_type == "anchored":
                         loss, sa, sb = anchored_contrastive_loss(z_eeg, z_a, z_b, margin=0.1, lambda_align=lambda_align, align_target=align_target)
+                    elif loss_type == "absolute":
+                        # Absolute Magnitude Scoring for Ear-EEG phase invariance
+                        sim_a = F.cosine_similarity(z_eeg, z_a, dim=1).mean(dim=1)
+                        sim_b = F.cosine_similarity(z_eeg, z_b, dim=1).mean(dim=1)
+                        loss = F.relu(0.1 - (torch.abs(sim_a) - torch.abs(sim_b))).mean()
+                        sa = torch.abs(sim_a).mean()
+                        sb = torch.abs(sim_b).mean()
                     else:
                         loss, sa, sb = contrastive_loss(z_eeg, z_a, z_b, margin=0.1)
                 
@@ -365,7 +376,7 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
                 train_sa += sa.item()
                 train_sb += sb.item()
                 
-            nc_va, nt_va = evaluate_model(model, X_va_full, YA_va_full, YB_va_full, device, window_sec=10)
+            nc_va, nt_va = evaluate_model(model, X_va_full, YA_va_full, YB_va_full, device, window_sec=10, use_absolute_scoring=(loss_type == "absolute"))
             val_acc = nc_va / max(nt_va, 1)
             
             if val_acc > best_val_acc:
@@ -397,25 +408,25 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
         print(f"  [Evaluation - Pearson Correlation, 10s]")
         w_sec = 10
         
-        nc_norm, nt_norm = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, metric="pearson")
+        nc_norm, nt_norm = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, metric="pearson", use_absolute_scoring=(loss_type == "absolute"))
         acc_norm = nc_norm / max(nt_norm, 1)
         
-        nc_zero, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, zero_eeg=True, metric="pearson")
+        nc_zero, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, zero_eeg=True, metric="pearson", use_absolute_scoring=(loss_type == "absolute"))
         acc_zero = nc_zero / max(nt_norm, 1)
         
-        nc_shuf, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, shuffle_labels=True, metric="pearson")
+        nc_shuf, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, shuffle_labels=True, metric="pearson", use_absolute_scoring=(loss_type == "absolute"))
         acc_shuf = nc_shuf / max(nt_norm, 1)
         
-        nc_shuf_eeg_time, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, shuffle_eeg_time=True, metric="pearson")
+        nc_shuf_eeg_time, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, shuffle_eeg_time=True, metric="pearson", use_absolute_scoring=(loss_type == "absolute"))
         acc_shuf_eeg_time = nc_shuf_eeg_time / max(nt_norm, 1)
         
-        nc_shuf_audio_time, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, shuffle_audio_time=True, metric="pearson")
+        nc_shuf_audio_time, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, shuffle_audio_time=True, metric="pearson", use_absolute_scoring=(loss_type == "absolute"))
         acc_shuf_audio_time = nc_shuf_audio_time / max(nt_norm, 1)
         
-        nc_perm_spatial, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, permute_spatial=True, metric="pearson")
+        nc_perm_spatial, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, permute_spatial=True, metric="pearson", use_absolute_scoring=(loss_type == "absolute"))
         acc_perm_spatial = nc_perm_spatial / max(nt_norm, 1)
         
-        nc_swap, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, swap_ab=True, metric="pearson")
+        nc_swap, _ = evaluate_model(model, X_te_full, YA_te_full, YB_te_full, device, window_sec=w_sec, swap_ab=True, metric="pearson", use_absolute_scoring=(loss_type == "absolute"))
         acc_swap = nc_swap / max(nt_norm, 1)
         
         print(f"    -> Window {w_sec:2d}s | Normal: {acc_norm*100:.2f}% | Decisions: {nt_norm}")
@@ -457,11 +468,11 @@ if __name__ == "__main__":
     parser.add_argument("--channels", type=int, nargs='+', default=[0, 33, 6, 41, 22, 59, 15, 52], help="EEG channel indices to use")
     parser.add_argument("--lowcut", type=float, default=1.0)
     parser.add_argument("--highcut", type=float, default=6.0)
-    parser.add_argument("--batch_size", type=int, default=512, help="Training batch size")
-    parser.add_argument("--num_workers", type=int, default=4, help="Dataloader num_workers")
-    parser.add_argument("--subjects", type=str, nargs='+', default=None, help="Specific subjects to run (e.g. S2_data_preproc)")
-    parser.add_argument("--loss", type=str, default="contrastive", choices=["contrastive", "anchored"], help="Loss function to use")
-    parser.add_argument("--lambda_align", type=float, default=0.5, help="Lambda for alignment penalty")
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--subjects", type=str, nargs="+", help="Specific subjects to run (e.g., S1_data_preproc)")
+    parser.add_argument("--loss", type=str, default="contrastive", choices=["contrastive", "anchored", "absolute"], help="Loss function")
+    parser.add_argument("--lambda_align", type=float, default=0.5, help="Weight for alignment penalty in anchored loss")
     parser.add_argument("--align_target", type=float, default=0.1, help="Positive alignment target for anchored loss")
     args = parser.parse_args()
     
