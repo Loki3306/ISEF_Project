@@ -310,19 +310,20 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
             cx, cya, cyb = chunk_trial(X_tr_full[i], YA_tr_full[i], YB_tr_full[i], TRAIN_WINDOW_SEC, TRAIN_HOP_SEC)
             X_tr.extend(cx); YA_tr.extend(cya); YB_tr.extend(cyb)
             
-        print("Converting to PyTorch Dataset...")
-        X_tr_t = torch.FloatTensor(np.stack(X_tr))
-        YA_tr_t = torch.FloatTensor(np.stack(YA_tr))
-        YB_tr_t = torch.FloatTensor(np.stack(YB_tr))
+        print("Converting to PyTorch Dataset and PRE-LOADING to VRAM...")
+        # Maximize GPU by sending the entire 3GB dataset directly to the 15GB VRAM
+        X_tr_t = torch.FloatTensor(np.stack(X_tr)).to(device)
+        YA_tr_t = torch.FloatTensor(np.stack(YA_tr)).to(device)
+        YB_tr_t = torch.FloatTensor(np.stack(YB_tr)).to(device)
         
         train_dataset = TensorDataset(X_tr_t, YA_tr_t, YB_tr_t)
+        
+        # When dataset is fully on GPU, num_workers MUST be 0
         train_loader = DataLoader(
             train_dataset, 
             batch_size=batch_size, 
             shuffle=True, 
-            num_workers=num_workers, 
-            pin_memory=True, 
-            persistent_workers=(num_workers > 0)
+            num_workers=0
         )
             
         # Model
