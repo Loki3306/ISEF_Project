@@ -364,7 +364,6 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
             
             # Update GRL lambda for this epoch
             if use_dann:
-                import numpy as np
                 p = float(epoch) / 100.0
                 grl_lambda = (2.0 / (1.0 + np.exp(-10.0 * p))) - 1.0
                 model.grl.lambda_ = grl_lambda

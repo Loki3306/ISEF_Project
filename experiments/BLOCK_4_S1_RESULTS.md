@@ -12,8 +12,8 @@
 - **S1 (EEGNetS1):** 1,299 total parameters (178 spatial)
 - **Delta:** +50 parameters. The parameter increase is so negligible (~4%) that it eliminates capacity inflation as a confound. S0+ capacity control was deemed mathematically unnecessary for this comparison.
 
-## 3. Results (Partial LOSO: S1–S12)
-Based on the first 12 subjects (S1 through S12):
+## 3. Results (Full 18-Fold LOSO)
+Based on all 18 subjects:
 
 | Subject | S1 Accuracy (10s) |
 | :--- | :--- |
@@ -29,11 +29,17 @@ Based on the first 12 subjects (S1 through S12):
 | S10 | 67.67% |
 | S11 | 54.33% |
 | S12 | 59.67% |
-| **Average (12 subjects)** | **59.33%** |
+| S13 | 59.33% |
+| S14 | 63.00% |
+| S15 | 68.67% |
+| S16 | 62.33% |
+| S17 | 33.67% |
+| S18 | 69.33% |
+| **Final Average (18 subjects)** | **59.35%** |
 
 ## 4. Scientific Interpretation
 - **S0 (E1 Baseline):** 59.28%
-- **S1 (Nonlinear Spatial):** 59.33%
+- **S1 (Nonlinear Spatial):** 59.35%
 
 According to the established Interpretation Matrix (Section 9):
 **Case C: S1 ≈ S0.** 
