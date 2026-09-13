@@ -62,7 +62,7 @@ def audit_trial_identity():
 
         data = load_subject_data(path)
         labels = trial_labels(data)
-        event_samples = trial_event_samples(path) if hasattr(data, 'event') else []
+        event_samples = trial_event_samples(data) if hasattr(data, 'event') else []
         fs_vals = fsample_values(data)
         n_trials = data.eeg.shape[1]
 
