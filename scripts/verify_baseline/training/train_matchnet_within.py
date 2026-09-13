@@ -375,11 +375,14 @@ def train_matchnet_within(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15
                 
         # Checkpointing
         os.makedirs("checkpoints", exist_ok=True)
-        final_path = f"checkpoints/matchnet_fold_{held_out_path.stem}_final.pth"
+        if best_val_acc > 0.0:
+            model.load_state_dict(best_weights)
+            
+        final_path = f"checkpoints/matchnet_within_{p.stem}_final.pth"
         torch.save(model.state_dict(), final_path)
         
         model.load_state_dict(best_weights)
-        best_path = f"checkpoints/matchnet_fold_{held_out_path.stem}_best.pth"
+        best_path = f"checkpoints/matchnet_within_{p.stem}_best.pth"
         torch.save(best_weights, best_path)
         
         print(f"  [Evaluation - Pearson Correlation, 10s]")
