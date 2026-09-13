@@ -9,7 +9,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[0]
 sys.path.insert(0, str(REPO_ROOT))
 
 from baselines.ridge_aad import load_subject_examples, subject_files
