@@ -1,42 +1,24 @@
 import torch
 import torch.nn as nn
 
-class MultiScaleTemporalLinear(nn.Module):
+class EEGNetMultiScaleM2(nn.Module):
     """
-    Bug-Free Multi-Scale Temporal block.
-    Outputs a purely linear projection (no GELU, no redundant BN)
-    to match the exact input structure expected by EEGNet's spatial block.
-    """
-    def __init__(self, in_channels=1, output_channels=8, filters_per_branch=9, kernels=[3, 7, 15, 31]):
-        super().__init__()
-        
-        self.branches = nn.ModuleList([
-            nn.Conv2d(in_channels, filters_per_branch, (1, k), padding=(0, k//2), bias=False)
-            for k in kernels
-        ])
-        
-        # 1x1 point-wise conv to project down to output_channels (8)
-        self.channel_mixing = nn.Conv2d(filters_per_branch * len(kernels), output_channels, (1, 1), bias=False)
-        
-    def forward(self, x):
-        outs = [branch(x) for branch in self.branches]
-        x = torch.cat(outs, dim=1) # [B, 36, C, T]
-        x = self.channel_mixing(x) # [B, 8, C, T]
-        return x # Purely linear output
-
-class EEGNetMultiScaleV1(nn.Module):
-    """
-    Diagnostic Model A: Original kernels (3, 7, 15, 31), capacity matched, BUG-FREE.
+    Diagnostic Model M2: Parameter-Controlled Multi-Scale
+    - Allocates 8 total filters across k={15, 31, 63, 127}
+    - Total parameters: 520 (approx matched to baseline 512)
+    - No 36->8 projection bottleneck
+    - Outputs exactly 8 temporal channels for spatial filtering
     """
     def __init__(self, in_channels=8, F1=8, D=2, F2=16):
         super().__init__()
         
-        self.temporal_conv = MultiScaleTemporalLinear(
-            in_channels=1, 
-            output_channels=F1, 
-            filters_per_branch=9, 
-            kernels=[3, 7, 15, 31]
-        )
+        assert F1 == 8, "M2 is hardcoded for exactly 8 output filters"
+        
+        # Allocations: k=15 (1 filter), k=31 (2 filters), k=63 (3 filters), k=127 (2 filters)
+        self.branch_15 = nn.Conv2d(1, 1, (1, 15), padding=(0, 15//2), bias=False)
+        self.branch_31 = nn.Conv2d(1, 2, (1, 31), padding=(0, 31//2), bias=False)
+        self.branch_63 = nn.Conv2d(1, 3, (1, 63), padding=(0, 63//2), bias=False)
+        self.branch_127 = nn.Conv2d(1, 2, (1, 127), padding=(0, 127//2), bias=False)
         
         # Standard EEGNet Spatial Block
         self.spatial_conv = nn.Sequential(
@@ -60,65 +42,25 @@ class EEGNetMultiScaleV1(nn.Module):
     def forward(self, x):
         orig_len = x.shape[-1]
         x = x.unsqueeze(1) 
-        x = self.temporal_conv(x) 
-        x = self.spatial_conv(x)  
-        x = self.block2(x) 
-        x = x.squeeze(2)   
-        x = self.output_proj(x) 
-        return x[..., :orig_len]
-
-
-class EEGNetMultiScaleV2(nn.Module):
-    """
-    Diagnostic Model B: 1-Second Context kernels (7, 15, 31, 63), capacity matched, BUG-FREE.
-    """
-    def __init__(self, in_channels=8, F1=8, D=2, F2=16):
-        super().__init__()
         
-        self.temporal_conv = MultiScaleTemporalLinear(
-            in_channels=1, 
-            output_channels=F1, 
-            filters_per_branch=9, 
-            kernels=[7, 15, 31, 63]
-        )
+        # Purely linear multi-scale concatenation (No bottleneck, no GELU)
+        temporal_out = torch.cat([
+            self.branch_15(x),
+            self.branch_31(x),
+            self.branch_63(x),
+            self.branch_127(x)
+        ], dim=1) # [B, 8, C, T]
         
-        # Standard EEGNet Spatial Block
-        self.spatial_conv = nn.Sequential(
-            nn.BatchNorm2d(F1),
-            nn.Conv2d(F1, F1 * D, (in_channels, 1), groups=F1, bias=False),
-            nn.BatchNorm2d(F1 * D),
-            nn.GELU(),
-            nn.Dropout(0.25)
-        )
-        
-        self.block2 = nn.Sequential(
-            nn.Conv2d(F1 * D, F1 * D, (1, 16), padding=(0, 8), groups=F1 * D, bias=False),
-            nn.Conv2d(F1 * D, F2, (1, 1), bias=False),
-            nn.BatchNorm2d(F2),
-            nn.GELU(),
-            nn.Dropout(0.25)
-        )
-        
-        self.output_proj = nn.Conv1d(F2, 1, kernel_size=1)
-
-    def forward(self, x):
-        orig_len = x.shape[-1]
-        x = x.unsqueeze(1) 
-        x = self.temporal_conv(x) 
-        x = self.spatial_conv(x)  
+        x = self.spatial_conv(temporal_out)  
         x = self.block2(x) 
         x = x.squeeze(2)   
         x = self.output_proj(x) 
         return x[..., :orig_len]
 
 def print_summary():
-    model1 = EEGNetMultiScaleV1()
-    params1 = sum(p.numel() for p in model1.parameters() if p.requires_grad)
-    print(f"EEGNetMultiScaleV1 (3/7/15/31) Parameter Count: {params1:,}")
-    
-    model2 = EEGNetMultiScaleV2()
-    params2 = sum(p.numel() for p in model2.parameters() if p.requires_grad)
-    print(f"EEGNetMultiScaleV2 (7/15/31/63) Parameter Count: {params2:,}")
+    model = EEGNetMultiScaleM2()
+    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"EEGNetMultiScaleM2 Parameter Count: {params:,}")
     
 if __name__ == "__main__":
     print_summary()

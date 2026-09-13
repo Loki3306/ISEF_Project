@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from models.eegnet import EEGNet
 from models.atcnet import ATCNet
 from models.eegnet_tcn import EEGNetTCN
+from models.eegnet_multiscale import EEGNetMultiScaleM2
 
 class AudioEncoder(nn.Module):
     """
@@ -61,18 +62,14 @@ class ContrastiveMatchNet(nn.Module):
             self.eeg_encoder = EEGNetS1(in_channels=eeg_channels)
             # Override the final projection
             self.eeg_encoder.output_proj = nn.Conv1d(16, latent_dim, kernel_size=1)
-        elif eeg_model_type.lower() == "eegnet_multiscale_v1":
-            from models.eegnet_multiscale import EEGNetMultiScaleV1
-            self.eeg_encoder = EEGNetMultiScaleV1(in_channels=eeg_channels)
-            self.eeg_encoder.output_proj = nn.Conv1d(16, latent_dim, kernel_size=1)
-        elif eeg_model_type.lower() == "eegnet_multiscale_v2":
-            from models.eegnet_multiscale import EEGNetMultiScaleV2
-            self.eeg_encoder = EEGNetMultiScaleV2(in_channels=eeg_channels)
-            self.eeg_encoder.output_proj = nn.Conv1d(16, latent_dim, kernel_size=1)
         elif eeg_model_type.lower() == "eegnet_s2":
             from models.eegnet_s2 import EEGNetS2
             self.eeg_encoder = EEGNetS2(in_channels=eeg_channels)
             # Override the final projection
+            self.eeg_encoder.output_proj = nn.Conv1d(16, latent_dim, kernel_size=1)
+        elif eeg_model_type.lower() == "eegnet_multiscale_m2":
+            from models.eegnet_multiscale import EEGNetMultiScaleM2
+            self.eeg_encoder = EEGNetMultiScaleM2(in_channels=eeg_channels)
             self.eeg_encoder.output_proj = nn.Conv1d(16, latent_dim, kernel_size=1)
         else:
             raise ValueError(f"Unknown eeg_model_type: {eeg_model_type}")
