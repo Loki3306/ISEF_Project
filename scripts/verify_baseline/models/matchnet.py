@@ -98,6 +98,25 @@ class TemporalDeformationField(nn.Module):
         
         return z_audio_warped, delta_seconds
 
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output = grad_output.neg() * ctx.lambda_
+        return output, None
+
+class GradientReversalLayer(nn.Module):
+    def __init__(self, lambda_=1.0):
+        super().__init__()
+        self.lambda_ = lambda_
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.lambda_)
+
 class ContrastiveMatchNet(nn.Module):
     """
     A Siamese network that explicitly learns a matching function between EEG and Audio.
@@ -153,11 +172,7 @@ class ContrastiveMatchNet(nn.Module):
         self.audio_encoder = AudioEncoder(in_channels=audio_channels, latent_dim=latent_dim)
         
         # 3. Domain Adversarial Components
-        try:
-            from models.msca_modules import GradientReversalLayer
-            self.grl = GradientReversalLayer(lambda_=0.0)
-        except ImportError:
-            self.grl = GradientReversalLayer(lambda_=0.0)
+        self.grl = GradientReversalLayer(lambda_=0.0)
             
         self.subject_classifier = nn.Sequential(
             nn.Linear(latent_dim, latent_dim // 2),
