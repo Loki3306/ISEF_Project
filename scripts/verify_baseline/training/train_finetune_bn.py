@@ -330,16 +330,19 @@ def train_finetune_bn(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52
             state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         model.load_state_dict(state_dict, strict=False)
         
-        # Freeze all layers except BatchNorm
-        trainable_params = 0
-        frozen_params = 0
-        for name, param in model.named_parameters():
-            if "bn" in name.lower() or "batchnorm" in name.lower():
-                param.requires_grad = True
-                trainable_params += param.numel()
-            else:
-                param.requires_grad = False
-                frozen_params += param.numel()
+        # Freeze ALL layers first
+        for param in model.parameters():
+            param.requires_grad = False
+            
+        # Mathematically correct unfreezing: target the exact module type, not the string name.
+        # This prevents accidentally freezing a BatchNorm named "norm" or unfreezing a LayerNorm named "bn".
+        for module in model.modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                for param in module.parameters():
+                    param.requires_grad = True
+                    
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
                 
         print(f"  [Freezing] Trainable Params (BN): {trainable_params:,} | Frozen Params: {frozen_params:,}")
 
@@ -347,8 +350,12 @@ def train_finetune_bn(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-4, weight_decay=1e-4)
         scaler = torch.cuda.amp.GradScaler()
         
-        best_val_acc = 0.0
+        print("  [Initial Evaluation] Establishing baseline performance...")
+        nc_va_init, nt_va_init = evaluate_model(model, X_va_full, YA_va_full, YB_va_full, device, window_sec=10)
+        best_val_acc = nc_va_init / max(nt_va_init, 1)
         best_weights = deepcopy(model.state_dict())
+        print(f"  [Baseline] Val Acc: {best_val_acc*100:.2f}%")
+        
         patience = 5
         epochs_no_improve = 0
         
