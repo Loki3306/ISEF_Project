@@ -168,9 +168,8 @@ def fit_ridge(
     return np.linalg.solve(XtX + ridge_lambda * np.eye(n_feat), Xty)
 
 
-def predict_envelope(eeg: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    """Reconstruct envelope from EEG using the trained weights."""
-    X = future_lagged_eeg(eeg)
+def predict_envelope(X: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Reconstruct envelope from pre-computed feature matrix using the trained weights."""
     return X @ weights
 
 
@@ -190,8 +189,12 @@ def eval_windows(
 ) -> tuple[int, int]:
     """Non-overlapping window evaluation. Returns (n_correct, n_windows)."""
     env_a, env_b = get_envelopes(ex)
-    eeg = ex.eeg
-    n = min(eeg.shape[0], len(env_a), len(env_b))
+    
+    # Pre-compute the feature matrix for the entire trial ONCE.
+    # Doing this per-window breaks sosfiltfilt (boundary effects on tiny chunks).
+    X_full = future_lagged_eeg(ex.eeg)
+    
+    n = min(X_full.shape[0], len(env_a), len(env_b))
 
     win = window_sec * FS
     n_correct = n_windows = 0
@@ -199,11 +202,16 @@ def eval_windows(
 
     while start + win <= n:
         end = start + win
-        pred = predict_envelope(eeg[start:end], weights)
+        pred = predict_envelope(X_full[start:end], weights)
         L = min(len(pred), win)
         pred  = pred[:L]
         ea_w  = env_a[start:start + L]
         eb_w  = env_b[start:start + L]
+
+        # Handle NaNs that might occur if the EEG chunk was perfectly flat
+        if np.isnan(pred).any():
+            start += win
+            continue
 
         ca, _ = pearsonr(pred, ea_w)
         cb, _ = pearsonr(pred, eb_w)
