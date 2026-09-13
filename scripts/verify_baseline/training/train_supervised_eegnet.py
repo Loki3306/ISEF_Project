@@ -27,6 +27,7 @@ TRAIN_HOP_SEC = 2
 
 def butter_bandpass_filter(data, lowcut, highcut, fs, order=2, axis=0):
     nyq = 0.5 * fs
+    highcut = min(highcut, nyq - 0.1)
     low = lowcut / nyq
     high = highcut / nyq
     b, a = butter(order, [low, high], btype='band')
