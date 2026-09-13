@@ -166,8 +166,9 @@ def fit_ridge(
         n = min(X_trial.shape[0], len(y_trial))
         
         # Transfer just this trial to GPU (instantly calculated, then discarded)
-        X_pt = torch.from_numpy(X_trial[:n]).to(device=device, dtype=torch.float64)
-        y_pt = torch.from_numpy(y_trial[:n]).to(device=device, dtype=torch.float64)
+        # .copy() is required because X_trial has negative strides from time-reversal
+        X_pt = torch.from_numpy(X_trial[:n].copy()).to(device=device, dtype=torch.float64)
+        y_pt = torch.from_numpy(y_trial[:n].copy()).to(device=device, dtype=torch.float64)
         
         XtX += X_pt.T @ X_pt
         Xty += X_pt.T @ y_pt
