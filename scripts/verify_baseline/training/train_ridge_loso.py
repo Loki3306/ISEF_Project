@@ -150,26 +150,41 @@ def fit_ridge(
     ridge_lambda: float = RIDGE_LAMBDA,
 ) -> np.ndarray:
     """Fit Ridge: EEG_future_lagged → attended_envelope."""
-    print(f"      [Ridge] Fitting model over {len(examples)} trials (incremental XtX)...")
+    print(f"      [Ridge] Fitting model over {len(examples)} trials (batched XtX)...")
     
-    # We must build XtX incrementally to avoid OOM (1020 trials = 28GB of RAM if concatenated!)
     n_feat = n_features(examples[0].eeg.shape[1])
     XtX = np.zeros((n_feat, n_feat), dtype=np.float64)
     Xty = np.zeros(n_feat, dtype=np.float64)
 
+    BATCH_SIZE = 50
+    X_batch = []
+    y_batch = []
+    
+    def process_batch():
+        if not X_batch: return
+        Xb = np.vstack(X_batch)
+        yb = np.concatenate(y_batch)
+        XtX[:] += Xb.T @ Xb
+        Xty[:] += Xb.T @ yb
+        X_batch.clear()
+        y_batch.clear()
+
     for i, ex in enumerate(examples):
-        if i % 100 == 0 and i > 0:
-            print(f"      [Ridge] Processed {i}/{len(examples)} trials...")
-            
         X_trial = future_lagged_eeg(ex.eeg)
         y_trial = attended_env(ex)
         n = min(X_trial.shape[0], len(y_trial))
         
-        X = X_trial[:n]
-        y = y_trial[:n]
+        X_batch.append(X_trial[:n])
+        y_batch.append(y_trial[:n])
         
-        XtX += X.T @ X
-        Xty += X.T @ y
+        if len(X_batch) >= BATCH_SIZE:
+            print(f"      [Ridge] Processed batch up to {i+1}/{len(examples)} trials...")
+            process_batch()
+            
+    # Process remaining
+    if X_batch:
+        print(f"      [Ridge] Processing final batch...")
+        process_batch()
 
     print("      [Ridge] Solving linear system...")
     return np.linalg.solve(XtX + ridge_lambda * np.eye(n_feat), Xty)
