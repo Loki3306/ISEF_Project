@@ -230,7 +230,7 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                 
     return n_correct, n_total
 
-def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False):
+def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False, use_dann=False):
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | MatchNet ({eeg_model}) | Channels: {channels}")
@@ -291,11 +291,18 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
             tX, tYA, tYB = prepare_dataset(subject_examples[str(p)], channels, lowcut, highcut, p.stem, mapping, envelopes)
             X_tr_full.extend(tX); YA_tr_full.extend(tYA); YB_tr_full.extend(tYB)
             
-        # Re-extract correctly without overlap
-        X_tr_full, YA_tr_full, YB_tr_full = [], [], []
+        X_tr_full, YA_tr_full, YB_tr_full, Subj_tr_full = [], [], [], []
         X_va_full, YA_va_full, YB_va_full = [], [], []
         
+        subject_id_map = {}
+        curr_id = 0
+        
         for p in train_paths:
+            if p.stem not in subject_id_map:
+                subject_id_map[p.stem] = curr_id
+                curr_id += 1
+            subj_id = subject_id_map[p.stem]
+            
             tX, tYA, tYB = prepare_dataset(subject_examples[str(p)], channels, lowcut, highcut, p.stem, mapping, envelopes)
             # 90/10 split at trial level
             v_split_idx = int(0.1 * len(tX))
@@ -305,22 +312,28 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
             X_tr_full.extend(tX[v_split_idx:])
             YA_tr_full.extend(tYA[v_split_idx:])
             YB_tr_full.extend(tYB[v_split_idx:])
+            Subj_tr_full.extend([subj_id] * len(tX[v_split_idx:]))
 
         X_te_full, YA_te_full, YB_te_full = prepare_dataset(test_exs, channels, lowcut, highcut, held_out_path.stem, mapping, envelopes)
         
         # Chunk training data
-        X_tr, YA_tr, YB_tr = [], [], []
+        X_tr, YA_tr, YB_tr, Subj_tr = [], [], [], []
         for i in range(len(X_tr_full)):
             cx, cya, cyb = chunk_trial(X_tr_full[i], YA_tr_full[i], YB_tr_full[i], TRAIN_WINDOW_SEC, TRAIN_HOP_SEC)
             X_tr.extend(cx); YA_tr.extend(cya); YB_tr.extend(cyb)
+            Subj_tr.extend([Subj_tr_full[i]] * len(cx))
             
         print("Converting to PyTorch Dataset and PRE-LOADING to VRAM...")
         # Maximize GPU by sending the entire 3GB dataset directly to the 15GB VRAM
         X_tr_t = torch.FloatTensor(np.stack(X_tr)).to(device)
         YA_tr_t = torch.FloatTensor(np.stack(YA_tr)).to(device)
         YB_tr_t = torch.FloatTensor(np.stack(YB_tr)).to(device)
+        Subj_tr_t = torch.LongTensor(Subj_tr).to(device)
         
-        train_dataset = TensorDataset(X_tr_t, YA_tr_t, YB_tr_t)
+        if use_dann:
+            train_dataset = TensorDataset(X_tr_t, YA_tr_t, YB_tr_t, Subj_tr_t)
+        else:
+            train_dataset = TensorDataset(X_tr_t, YA_tr_t, YB_tr_t)
         
         # When dataset is fully on GPU, num_workers MUST be 0
         train_loader = DataLoader(
@@ -331,7 +344,8 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
         )
             
         # Model
-        model = ContrastiveMatchNet(eeg_model_type=eeg_model, eeg_channels=len(channels), audio_channels=NUM_BANDS, latent_dim=64).to(device)
+        num_subjects = len(train_paths)
+        model = ContrastiveMatchNet(eeg_model_type=eeg_model, eeg_channels=len(channels), audio_channels=NUM_BANDS, latent_dim=64, num_subjects=num_subjects).to(device)
         optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
         scaler = torch.cuda.amp.GradScaler()
         
@@ -348,7 +362,20 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
             train_sa = 0.0
             train_sb = 0.0
             
-            for bx, bya, byb in train_loader:
+            # Update GRL lambda for this epoch
+            if use_dann:
+                import numpy as np
+                p = float(epoch) / 100.0
+                grl_lambda = (2.0 / (1.0 + np.exp(-10.0 * p))) - 1.0
+                model.grl.lambda_ = grl_lambda
+                
+            for batch in train_loader:
+                if use_dann:
+                    bx, bya, byb, b_subj = batch
+                    b_subj = b_subj.to(device, non_blocking=True)
+                else:
+                    bx, bya, byb = batch
+                    
                 bx = bx.to(device, non_blocking=True)
                 bya = bya.to(device, non_blocking=True)
                 byb = byb.to(device, non_blocking=True)
@@ -362,7 +389,10 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
                 
                 optimizer.zero_grad()
                 with torch.cuda.amp.autocast():
-                    z_eeg, z_a, z_b = model(bx, bya, byb)
+                    if use_dann:
+                        z_eeg, z_a, z_b, subj_logits = model(bx, bya, byb, return_subject_logits=True)
+                    else:
+                        z_eeg, z_a, z_b = model(bx, bya, byb)
                     if loss_type == "anchored":
                         loss, sa, sb = anchored_contrastive_loss(z_eeg, z_a, z_b, margin=0.1, lambda_align=lambda_align, align_target=align_target)
                     elif loss_type == "absolute":
@@ -374,6 +404,10 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
                         sb = torch.abs(sim_b).mean()
                     else:
                         loss, sa, sb = contrastive_loss(z_eeg, z_a, z_b, margin=0.1)
+                        
+                    if use_dann:
+                        loss_subj = F.cross_entropy(subj_logits, b_subj)
+                        loss = loss + loss_subj
                 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -482,6 +516,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_align", type=float, default=0.5, help="Weight for alignment penalty in anchored loss")
     parser.add_argument("--align_target", type=float, default=0.1, help="Positive alignment target for anchored loss")
     parser.add_argument("--augment_sign_flip", action="store_true", help="Randomly flip EEG sign during training to enforce phase-invariance")
+    parser.add_argument("--use_dann", action="store_true", help="Use Domain Adversarial Neural Network to enforce subject invariance")
     args = parser.parse_args()
     
-    train_matchnet_loso(args.model, args.channels, args.lowcut, args.highcut, args.batch_size, args.num_workers, args.subjects, args.loss, args.lambda_align, args.align_target, args.augment_sign_flip)
+    train_matchnet_loso(args.model, args.channels, args.lowcut, args.highcut, args.batch_size, args.num_workers, args.subjects, args.loss, args.lambda_align, args.align_target, args.augment_sign_flip, args.use_dann)

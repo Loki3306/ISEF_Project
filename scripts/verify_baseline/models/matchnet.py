@@ -39,7 +39,7 @@ class ContrastiveMatchNet(nn.Module):
     """
     A Siamese network that explicitly learns a matching function between EEG and Audio.
     """
-    def __init__(self, eeg_model_type="eegnet", eeg_channels=8, audio_channels=28, latent_dim=64):
+    def __init__(self, eeg_model_type="eegnet", eeg_channels=8, audio_channels=28, latent_dim=64, num_subjects=17):
         super().__init__()
         
         # 1. EEG Encoder
@@ -85,6 +85,27 @@ class ContrastiveMatchNet(nn.Module):
         # 2. Audio Encoder
         self.audio_encoder = AudioEncoder(in_channels=audio_channels, latent_dim=latent_dim)
         
+        # 3. Domain Adversarial Components
+        try:
+            from models.msca_modules import GradientReversalLayer
+            self.grl = GradientReversalLayer(lambda_=0.0)
+        except ImportError:
+            # Fallback if not running in the right directory context
+            class _GRLFallback(nn.Module):
+                def __init__(self, lambda_=0.0):
+                    super().__init__()
+                    self.lambda_ = lambda_
+                def forward(self, x):
+                    return x # DANN won't work in this fallback
+            self.grl = _GRLFallback(lambda_=0.0)
+            
+        self.subject_classifier = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(latent_dim // 2, num_subjects)
+        )
+        
         self.latent_dim = latent_dim
 
     def encode_eeg(self, eeg):
@@ -95,7 +116,7 @@ class ContrastiveMatchNet(nn.Module):
         """ Returns [B, latent_dim, Time] """
         return self.audio_encoder(audio)
 
-    def forward(self, eeg, audio_a, audio_b):
+    def forward(self, eeg, audio_a, audio_b, return_subject_logits=False):
         """
         Forward pass for training.
         eeg: [B, C, T]
@@ -107,6 +128,13 @@ class ContrastiveMatchNet(nn.Module):
         z_eeg = self.encode_eeg(eeg)
         z_a = self.encode_audio(audio_a)
         z_b = self.encode_audio(audio_b)
+        
+        if return_subject_logits:
+            z_pool = z_eeg.mean(dim=-1)
+            subj_feat = self.grl(z_pool)
+            subj_logits = self.subject_classifier(subj_feat)
+            return z_eeg, z_a, z_b, subj_logits
+            
         return z_eeg, z_a, z_b
 
     def compute_similarities(self, z_eeg, z_a, z_b):
