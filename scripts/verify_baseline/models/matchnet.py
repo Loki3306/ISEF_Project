@@ -226,6 +226,43 @@ def infonce_loss(z_eeg, z_a, z_b, temperature=0.1):
         
     return loss, sim_a_diag, sim_b_diag
 
+def dcca_loss(H1, H2, r1=1e-3, r2=1e-3, eps=1e-9):
+    """
+    Computes the Deep Canonical Correlation Analysis (DCCA) loss between two views.
+    H1, H2: tensors of shape [Batch * T, Features] or [Batch, Features]
+    """
+    # 1. Mean center the batches
+    H1_mean = H1 - H1.mean(dim=0, keepdim=True)
+    H2_mean = H2 - H2.mean(dim=0, keepdim=True)
+    
+    batch_size = H1.size(0)
+    
+    # 2. Compute covariance matrices
+    SigmaHat12 = (1.0 / (batch_size - 1)) * torch.matmul(H1_mean.t(), H2_mean)
+    SigmaHat11 = (1.0 / (batch_size - 1)) * torch.matmul(H1_mean.t(), H1_mean) + r1 * torch.eye(H1.size(1), device=H1.device)
+    SigmaHat22 = (1.0 / (batch_size - 1)) * torch.matmul(H2_mean.t(), H2_mean) + r2 * torch.eye(H2.size(1), device=H2.device)
+    
+    # 3. Compute inverse square roots using robust eigenvalue decomposition
+    D1, V1 = torch.linalg.eigh(SigmaHat11)
+    D1 = torch.clamp(D1, min=eps)
+    SigmaHat11RootInv = torch.matmul(torch.matmul(V1, torch.diag(D1 ** -0.5)), V1.t())
+    
+    D2, V2 = torch.linalg.eigh(SigmaHat22)
+    D2 = torch.clamp(D2, min=eps)
+    SigmaHat22RootInv = torch.matmul(torch.matmul(V2, torch.diag(D2 ** -0.5)), V2.t())
+    
+    # 4. Compute T = Σ11^{-1/2} Σ12 Σ22^{-1/2}
+    T_matrix = torch.matmul(torch.matmul(SigmaHat11RootInv, SigmaHat12), SigmaHat22RootInv)
+    
+    # 5. Compute CCA objective: sum of singular values of T
+    # Use svdvals for gradient stability
+    svdvals = torch.linalg.svdvals(T_matrix)
+    
+    # Loss is the negative sum of canonical correlations
+    loss = -torch.sum(svdvals)
+    
+    return loss, svdvals.mean(), svdvals.mean()
+
 if __name__ == "__main__":
     model = ContrastiveMatchNet("eegnet")
     eeg = torch.randn(16, 8, 320)

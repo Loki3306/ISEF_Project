@@ -18,7 +18,7 @@ from torch.utils.data import TensorDataset, DataLoader
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from models.matchnet import ContrastiveMatchNet, contrastive_loss, anchored_contrastive_loss
+from models.matchnet import ContrastiveMatchNet, contrastive_loss, anchored_contrastive_loss, dcca_loss
 from baselines.ridge_aad import load_subject_examples, subject_files, iter_leave_one_subject_out
 
 FS = 64
@@ -401,6 +401,13 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
                         loss = F.relu(0.1 - (torch.abs(sim_a) - torch.abs(sim_b))).mean()
                         sa = torch.abs(sim_a).mean()
                         sb = torch.abs(sim_b).mean()
+                    elif loss_type == "dcca":
+                        # DCCA operates on flattened [Batch * T, Features] tensors
+                        B, D, T = z_eeg.shape
+                        z_eeg_flat = z_eeg.transpose(1, 2).reshape(B * T, D)
+                        z_a_flat = z_a.transpose(1, 2).reshape(B * T, D)
+                        
+                        loss, sa, sb = dcca_loss(z_eeg_flat, z_a_flat)
                     else:
                         loss, sa, sb = contrastive_loss(z_eeg, z_a, z_b, margin=0.1)
                         
@@ -511,7 +518,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--subjects", type=str, nargs="+", help="Specific subjects to run (e.g., S1_data_preproc)")
-    parser.add_argument("--loss", type=str, default="contrastive", choices=["contrastive", "anchored", "absolute"], help="Loss function")
+    parser.add_argument("--loss", type=str, default="contrastive", choices=["contrastive", "anchored", "absolute", "dcca"], help="Loss function")
     parser.add_argument("--lambda_align", type=float, default=0.5, help="Weight for alignment penalty in anchored loss")
     parser.add_argument("--align_target", type=float, default=0.1, help="Positive alignment target for anchored loss")
     parser.add_argument("--augment_sign_flip", action="store_true", help="Randomly flip EEG sign during training to enforce phase-invariance")
