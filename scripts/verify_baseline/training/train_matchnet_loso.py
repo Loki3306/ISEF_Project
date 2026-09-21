@@ -243,26 +243,36 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
     return n_correct, n_total
 
 class ChunkDataset(torch.utils.data.Dataset):
-    def __init__(self, X_list, YA_list, YB_list, Subj_list=None):
-        self.X = X_list
-        self.YA = YA_list
-        self.YB = YB_list
-        self.Subj = Subj_list
+    def __init__(self, X_full, YA_full, YB_full, chunk_indices, Subj_full=None):
+        self.X_full = X_full
+        self.YA_full = YA_full
+        self.YB_full = YB_full
+        self.chunk_indices = chunk_indices
+        self.Subj_full = Subj_full
         
     def __len__(self):
-        return len(self.X)
+        return len(self.chunk_indices)
         
     def __getitem__(self, idx):
-        x = torch.FloatTensor(self.X[idx])
-        ya = torch.FloatTensor(self.YA[idx])
-        yb = torch.FloatTensor(self.YB[idx])
-        if self.Subj is not None:
-            subj = torch.tensor(self.Subj[idx], dtype=torch.long)
+        trial_idx, start, end = self.chunk_indices[idx]
+        
+        x = torch.FloatTensor(self.X_full[trial_idx][:, start:end])
+        ya = torch.FloatTensor(self.YA_full[trial_idx][:, start:end])
+        yb = torch.FloatTensor(self.YB_full[trial_idx][:, start:end])
+        
+        if self.Subj_full is not None:
+            subj = torch.tensor(self.Subj_full[trial_idx], dtype=torch.long)
             return x, ya, yb, subj
         return x, ya, yb
 
 def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52], lowcut=1.0, highcut=6.0, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False, use_dann=False, use_temporal_transport=False, file_disjoint=False, audio_rep="gammatone", audio_env_file="", audio_layer_idx=0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Prevent PyTorch multiprocessing memory duplication (Copy-on-Write failure) when using massive datasets
+    if audio_rep == "wavlm":
+        print("Forcing num_workers=0 for WavLM to prevent multiprocessing RAM explosion.")
+        num_workers = 0
+        
     print(f"Using device: {device} | MatchNet ({eeg_model}) | Channels: {channels}")
     
     mapping, envelopes = get_mapping_data(audio_rep, audio_env_file)
@@ -326,17 +336,15 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
                     held_out_audio_files.add(trial['wavB']['filename'])
             print(f"  [File-Disjoint] Filtering out {len(held_out_audio_files)} audio files used by {sub_key_test} from training...")
             
-        X_tr_full, YA_tr_full, YB_tr_full = [], [], []
-        for p in train_paths:
-            if str(p) in [e.subject for e in val_exs]: continue # Skip validation mixing roughly
-            tX, tYA, tYB = prepare_dataset(subject_examples[str(p)], channels, lowcut, highcut, p.stem, mapping, envelopes, exclude_audio_files=held_out_audio_files, audio_layer_idx=audio_layer_idx)
-            X_tr_full.extend(tX); YA_tr_full.extend(tYA); YB_tr_full.extend(tYB)
-            
-        X_tr_full, YA_tr_full, YB_tr_full, Subj_tr_full = [], [], [], []
-        X_va_full, YA_va_full, YB_va_full = [], [], []
+        X_va_full = []
+        YA_va_full = []
+        YB_va_full = []
         
-        subject_id_map = {}
+        X_tr_full, YA_tr_full, YB_tr_full = [], [], []
+        Subj_tr_full = []
+        Subj_va_full = []
         curr_id = 0
+        subject_id_map = {}
         
         for p in train_paths:
             if p.stem not in subject_id_map:
@@ -344,12 +352,14 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
                 curr_id += 1
             subj_id = subject_id_map[p.stem]
             
-            tX, tYA, tYB = prepare_dataset(subject_examples[str(p)], channels, lowcut, highcut, p.stem, mapping, envelopes, audio_layer_idx=audio_layer_idx)
-            # 90/10 split at trial level
+            tX, tYA, tYB = prepare_dataset(subject_examples[str(p)], channels, lowcut, highcut, p.stem, mapping, envelopes, exclude_audio_files=held_out_audio_files, audio_layer_idx=audio_layer_idx)
+            
             v_split_idx = int(0.1 * len(tX))
             X_va_full.extend(tX[:v_split_idx])
             YA_va_full.extend(tYA[:v_split_idx])
             YB_va_full.extend(tYB[:v_split_idx])
+            Subj_va_full.extend([subj_id] * len(tX[:v_split_idx]))
+            
             X_tr_full.extend(tX[v_split_idx:])
             YA_tr_full.extend(tYA[v_split_idx:])
             YB_tr_full.extend(tYB[v_split_idx:])
@@ -357,23 +367,41 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
 
         X_te_full, YA_te_full, YB_te_full = prepare_dataset(test_exs, channels, lowcut, highcut, held_out_path.stem, mapping, envelopes, audio_layer_idx=audio_layer_idx)
         
-        # Chunk training data
-        X_tr, YA_tr, YB_tr, Subj_tr = [], [], [], []
-        for i in range(len(X_tr_full)):
-            cx, cya, cyb = chunk_trial(X_tr_full[i], YA_tr_full[i], YB_tr_full[i], TRAIN_WINDOW_SEC, TRAIN_HOP_SEC)
-            X_tr.extend(cx); YA_tr.extend(cya); YB_tr.extend(cyb)
-            Subj_tr.extend([Subj_tr_full[i]] * len(cx))
-            
-        print("Converting to PyTorch Dataset (Lazy Loading to avoid OOM)...")
-        if use_dann:
-            train_dataset = ChunkDataset(X_tr, YA_tr, YB_tr, Subj_tr)
-        else:
-            train_dataset = ChunkDataset(X_tr, YA_tr, YB_tr)
+        # Chunk training data indices instead of copying arrays
+        chunk_indices = []
+        win_samples = int(TRAIN_WINDOW_SEC * FS)
+        hop_samples = int(TRAIN_HOP_SEC * FS)
         
+        for i in range(len(X_tr_full)):
+            trial_len = X_tr_full[i].shape[1]
+            start = 0
+            while start + win_samples <= trial_len:
+                chunk_indices.append((i, start, start + win_samples))
+                start += hop_samples
+            
+        train_dataset = ChunkDataset(X_tr_full, YA_tr_full, YB_tr_full, chunk_indices, Subj_tr_full if use_dann else None)
         train_loader = DataLoader(
             train_dataset, 
             batch_size=batch_size, 
             shuffle=True, 
+            num_workers=num_workers,
+            pin_memory=True
+        )
+        
+        # Validation chunking
+        val_chunk_indices = []
+        for i in range(len(X_va_full)):
+            trial_len = X_va_full[i].shape[1]
+            start = 0
+            while start + win_samples <= trial_len:
+                val_chunk_indices.append((i, start, start + win_samples))
+                start += hop_samples
+                
+        val_dataset = ChunkDataset(X_va_full, YA_va_full, YB_va_full, val_chunk_indices, Subj_va_full if use_dann else None)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
             num_workers=num_workers,
             pin_memory=True
         )
@@ -397,7 +425,7 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
         patience = 10
         epochs_no_improve = 0
         
-        print(f"Training on {len(X_tr)} chunks ({TRAIN_WINDOW_SEC}s) | Batch Size: {batch_size} | Workers: {num_workers}...")
+        print(f"Training on {len(chunk_indices)} chunks ({TRAIN_WINDOW_SEC}s) | Batch Size: {batch_size} | Workers: {num_workers}...")
         
         for epoch in range(100):
             model.train()
