@@ -79,7 +79,7 @@ def get_mapping_data(audio_rep="gammatone", audio_env_file=""):
         envelopes = pickle.load(f)
     return mapping, envelopes
 
-def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, envelopes, exclude_audio_files=None):
+def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, envelopes, exclude_audio_files=None, audio_layer_idx=0):
     X = []
     Y_A = []
     Y_B = []
@@ -104,6 +104,10 @@ def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, en
             # Event labels (1 or 2) indicate speaker gender, NOT attention.
             env_attended = env_a
             env_unattended = env_b
+            
+            if len(env_attended.shape) == 3:
+                env_attended = env_attended[audio_layer_idx]
+                env_unattended = env_unattended[audio_layer_idx]
         else:
             print(f"Warning: Missing mapping for {sub_key} {trial_key}")
             continue
@@ -257,7 +261,7 @@ class ChunkDataset(torch.utils.data.Dataset):
             return x, ya, yb, subj
         return x, ya, yb
 
-def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52], lowcut=1.0, highcut=6.0, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False, use_dann=False, use_temporal_transport=False, file_disjoint=False, audio_rep="gammatone", audio_env_file=""):
+def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52], lowcut=1.0, highcut=6.0, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False, use_dann=False, use_temporal_transport=False, file_disjoint=False, audio_rep="gammatone", audio_env_file="", audio_layer_idx=0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | MatchNet ({eeg_model}) | Channels: {channels}")
     
@@ -325,7 +329,7 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
         X_tr_full, YA_tr_full, YB_tr_full = [], [], []
         for p in train_paths:
             if str(p) in [e.subject for e in val_exs]: continue # Skip validation mixing roughly
-            tX, tYA, tYB = prepare_dataset(subject_examples[str(p)], channels, lowcut, highcut, p.stem, mapping, envelopes, exclude_audio_files=held_out_audio_files)
+            tX, tYA, tYB = prepare_dataset(subject_examples[str(p)], channels, lowcut, highcut, p.stem, mapping, envelopes, exclude_audio_files=held_out_audio_files, audio_layer_idx=audio_layer_idx)
             X_tr_full.extend(tX); YA_tr_full.extend(tYA); YB_tr_full.extend(tYB)
             
         X_tr_full, YA_tr_full, YB_tr_full, Subj_tr_full = [], [], [], []
@@ -340,7 +344,7 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
                 curr_id += 1
             subj_id = subject_id_map[p.stem]
             
-            tX, tYA, tYB = prepare_dataset(subject_examples[str(p)], channels, lowcut, highcut, p.stem, mapping, envelopes)
+            tX, tYA, tYB = prepare_dataset(subject_examples[str(p)], channels, lowcut, highcut, p.stem, mapping, envelopes, audio_layer_idx=audio_layer_idx)
             # 90/10 split at trial level
             v_split_idx = int(0.1 * len(tX))
             X_va_full.extend(tX[:v_split_idx])
@@ -351,7 +355,7 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
             YB_tr_full.extend(tYB[v_split_idx:])
             Subj_tr_full.extend([subj_id] * len(tX[v_split_idx:]))
 
-        X_te_full, YA_te_full, YB_te_full = prepare_dataset(test_exs, channels, lowcut, highcut, held_out_path.stem, mapping, envelopes)
+        X_te_full, YA_te_full, YB_te_full = prepare_dataset(test_exs, channels, lowcut, highcut, held_out_path.stem, mapping, envelopes, audio_layer_idx=audio_layer_idx)
         
         # Chunk training data
         X_tr, YA_tr, YB_tr, Subj_tr = [], [], [], []
@@ -597,6 +601,7 @@ if __name__ == "__main__":
     parser.add_argument("--file_disjoint", action="store_true", help="Enforce strictly disjoint audio files between train and test sets")
     parser.add_argument("--audio_rep", type=str, default="gammatone", choices=["gammatone", "wavlm"], help="Audio representation to use")
     parser.add_argument("--audio_env_file", type=str, default="", help="Path to audio features pkl file (overrides default search)")
+    parser.add_argument("--audio_layer_idx", type=int, default=1, help="Index of the WavLM layer to use (e.g. 0=L3, 1=L6, 2=L9, 3=L12)")
     args = parser.parse_args()
     
     train_matchnet_loso(
@@ -615,5 +620,6 @@ if __name__ == "__main__":
         use_temporal_transport=args.use_temporal_transport,
         file_disjoint=args.file_disjoint,
         audio_rep=args.audio_rep,
-        audio_env_file=args.audio_env_file
+        audio_env_file=args.audio_env_file,
+        audio_layer_idx=args.audio_layer_idx
     )
