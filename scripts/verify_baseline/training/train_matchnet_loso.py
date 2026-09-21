@@ -124,9 +124,9 @@ def prepare_dataset(examples, channels, lowcut, highcut, subject_id, mapping, en
         env_attended = normalize_array(env_attended.T).T
         env_unattended = normalize_array(env_unattended.T).T
         
-        X.append(x_norm)
-        Y_A.append(env_attended)
-        Y_B.append(env_unattended)
+        X.append(x_norm.astype(np.float32))
+        Y_A.append(env_attended.astype(np.float32))
+        Y_B.append(env_unattended.astype(np.float32))
         
     return X, Y_A, Y_B
 
@@ -257,9 +257,9 @@ class ChunkDataset(torch.utils.data.Dataset):
         trial_idx, start, end = self.chunk_indices[idx]
         
         # Slicing a PyTorch tensor returns a view (zero memory allocation)
-        x = self.X_full[trial_idx][:, start:end].float()
-        ya = self.YA_full[trial_idx][:, start:end].float()
-        yb = self.YB_full[trial_idx][:, start:end].float()
+        x = self.X_full[trial_idx][:, start:end]
+        ya = self.YA_full[trial_idx][:, start:end]
+        yb = self.YB_full[trial_idx][:, start:end]
         
         if self.Subj_full is not None:
             subj = torch.tensor(self.Subj_full[trial_idx], dtype=torch.long)
@@ -367,6 +367,11 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
             Subj_tr_full.extend([subj_id] * len(tX[v_split_idx:]))
 
         X_te_full, YA_te_full, YB_te_full = prepare_dataset(test_exs, channels, lowcut, highcut, held_out_path.stem, mapping, envelopes, audio_layer_idx=audio_layer_idx)
+        
+        # Free the massive 9.4 GB envelopes dictionary now that everything is extracted
+        del envelopes
+        import gc
+        gc.collect()
         
         # Convert lists of numpy arrays to lists of PyTorch tensors to enable zero-copy slicing in __getitem__
         X_tr_full = [torch.from_numpy(x) for x in X_tr_full]
