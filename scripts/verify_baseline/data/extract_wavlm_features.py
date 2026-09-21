@@ -8,12 +8,12 @@ from scipy.io import wavfile
 import librosa
 from scipy.signal import resample_poly
 import math
-from transformers import WavLMModel
+from transformers import WavLMModel, AutoFeatureExtractor
 
 OUT_FILE = Path(__file__).resolve().parents[1] / "data" / "wavlm_features.pkl"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def extract_wavlm_features(wav_path, model, target_fs=64, target_layer=6):
+def extract_wavlm_features(wav_path, model, processor, target_fs=64, target_layer=6):
     """
     Extracts frozen WavLM representations for a given audio file.
     WavLM expects 16kHz audio. Its output frame rate is 50Hz (20ms stride).
@@ -21,12 +21,13 @@ def extract_wavlm_features(wav_path, model, target_fs=64, target_layer=6):
     """
     # 1. Load and resample audio to 16000 Hz (WavLM native)
     data, fs = librosa.load(wav_path, sr=16000, mono=True)
+    audio_duration = len(data) / fs
     
     # 2. Extract WavLM representations (frozen)
-    inputs = torch.tensor(data).unsqueeze(0).to(DEVICE) # [1, Samples]
+    inputs = processor(data, sampling_rate=16000, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         # output_hidden_states=True returns a tuple of all layers
-        outputs = model(inputs, output_hidden_states=True)
+        outputs = model(inputs.input_values, output_hidden_states=True)
         
     # Hidden states tuple has 13 elements (0 is embedding, 1-12 are layers)
     # Shape: [1, Frames, 768]
@@ -34,6 +35,7 @@ def extract_wavlm_features(wav_path, model, target_fs=64, target_layer=6):
     
     # Transpose to [768, Frames]
     hidden_states = hidden_states.T
+    wavlm_frames = hidden_states.shape[-1]
     
     # 3. Resample from 50 Hz to 64 Hz
     # WavLM frame shift is 320 samples at 16kHz = 20ms = 50 Hz
@@ -44,6 +46,10 @@ def extract_wavlm_features(wav_path, model, target_fs=64, target_layer=6):
     
     # resample_poly operates along the last axis by default
     resampled_features = resample_poly(hidden_states, up, down, axis=-1)
+    resampled_frames = resampled_features.shape[-1]
+    
+    # Diagnostic print to verify lengths
+    print(f"  {wav_path.name}: {audio_duration:.2f}s -> {wavlm_frames} WavLM frames -> {resampled_frames} 64Hz frames")
     
     return resampled_features
 
@@ -51,6 +57,7 @@ def main(audio_dir, layer=6):
     OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     wav_files = list(audio_dir.glob("*.wav"))
     print(f"Loading microsoft/wavlm-base on {DEVICE}...")
+    processor = AutoFeatureExtractor.from_pretrained("microsoft/wavlm-base")
     model = WavLMModel.from_pretrained("microsoft/wavlm-base").to(DEVICE)
     model.eval()
     
@@ -61,7 +68,7 @@ def main(audio_dir, layer=6):
         if (i+1) % 10 == 0:
             print(f"[{i+1}/{len(wav_files)}] Processing...")
         try:
-            feats = extract_wavlm_features(w, model, target_layer=layer)
+            feats = extract_wavlm_features(w, model, processor, target_layer=layer)
             results[w.name] = feats
         except Exception as e:
             print(f"Failed {w.name}: {e}")
