@@ -195,13 +195,13 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                     print(f"Window length: {window_samples} samples ({window_sec}s)")
                     printed_boundary = True
                     
-                x_chunk = torch.FloatTensor(x_np[:, start:end]).unsqueeze(0).to(device)
+                x_chunk = x_np[:, start:end].unsqueeze(0).to(device, dtype=torch.float32)
                 
                 if zero_eeg:
                     x_chunk = torch.zeros_like(x_chunk)
                     
-                ya_chunk = torch.FloatTensor(ya_np[:, start:end]).unsqueeze(0).to(device)
-                yb_chunk = torch.FloatTensor(yb_np[:, start:end]).unsqueeze(0).to(device)
+                ya_chunk = ya_np[:, start:end].unsqueeze(0).to(device, dtype=torch.float32)
+                yb_chunk = yb_np[:, start:end].unsqueeze(0).to(device, dtype=torch.float32)
                 
                 if swap_ab:
                     ya_chunk, yb_chunk = yb_chunk, ya_chunk
@@ -373,10 +373,18 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
         import gc
         gc.collect()
         
-        # Convert lists of numpy arrays to lists of PyTorch tensors to enable zero-copy slicing in __getitem__
+        # Convert all lists of numpy arrays to lists of PyTorch tensors to enable zero-copy slicing
         X_tr_full = [torch.from_numpy(x) for x in X_tr_full]
         YA_tr_full = [torch.from_numpy(x) for x in YA_tr_full]
         YB_tr_full = [torch.from_numpy(x) for x in YB_tr_full]
+        
+        X_va_full = [torch.from_numpy(x) for x in X_va_full]
+        YA_va_full = [torch.from_numpy(x) for x in YA_va_full]
+        YB_va_full = [torch.from_numpy(x) for x in YB_va_full]
+        
+        X_te_full = [torch.from_numpy(x) for x in X_te_full]
+        YA_te_full = [torch.from_numpy(x) for x in YA_te_full]
+        YB_te_full = [torch.from_numpy(x) for x in YB_te_full]
         
         # Chunk training data indices instead of copying arrays
         chunk_indices = []
@@ -396,7 +404,7 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
             batch_size=batch_size, 
             shuffle=True, 
             num_workers=num_workers,
-            pin_memory=True
+            pin_memory=(num_workers > 0)
         )
             
         # Model
