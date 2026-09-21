@@ -121,7 +121,7 @@ class ContrastiveMatchNet(nn.Module):
     """
     A Siamese network that explicitly learns a matching function between EEG and Audio.
     """
-    def __init__(self, eeg_model_type="eegnet", eeg_channels=8, audio_channels=28, latent_dim=64, num_subjects=17, use_temporal_transport=False):
+    def __init__(self, eeg_model_type="eegnet", eeg_channels=8, audio_channels=28, latent_dim=64, num_subjects=17, use_temporal_transport=False, audio_model_type="gammatone"):
         super().__init__()
         
         self.use_temporal_transport = use_temporal_transport
@@ -169,7 +169,14 @@ class ContrastiveMatchNet(nn.Module):
             raise ValueError(f"Unknown eeg_model_type: {eeg_model_type}")
             
         # 2. Audio Encoder
-        self.audio_encoder = AudioEncoder(in_channels=audio_channels, latent_dim=latent_dim)
+        if audio_model_type.lower() == "gammatone":
+            self.audio_encoder = AudioEncoder(in_channels=audio_channels, latent_dim=latent_dim)
+        elif audio_model_type.lower() == "wavlm":
+            self.audio_encoder = nn.Sequential(
+                nn.Conv1d(audio_channels, latent_dim, kernel_size=1)
+            )
+        else:
+            raise ValueError(f"Unknown audio_model_type: {audio_model_type}")
         
         # 3. Domain Adversarial Components
         self.grl = GradientReversalLayer(lambda_=0.0)

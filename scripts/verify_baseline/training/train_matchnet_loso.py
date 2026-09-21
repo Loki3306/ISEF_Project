@@ -45,7 +45,7 @@ def normalize_array_global(arr):
     scale = arr.std() + 1e-12
     return arr / scale
 
-def get_mapping_data():
+def get_mapping_data(audio_rep="gammatone", audio_env_file=""):
     base_dir = Path("/kaggle/input")
     
     # 1. Find audio_mapping.json
@@ -55,15 +55,20 @@ def get_mapping_data():
     else:
         map_file = REPO_ROOT / "data" / "audio_mapping.json"
         
-    # 2. Find gammatone envelopes pkl
-    pkl_files = list(base_dir.rglob("*gammatone*.pkl"))
-    if not pkl_files:
-        pkl_files = list(base_dir.rglob("*.pkl"))
-        
-    if pkl_files:
-        env_file = pkl_files[0]
+    # 2. Find envelopes pkl
+    if audio_env_file:
+        env_file = Path(audio_env_file)
     else:
-        env_file = REPO_ROOT / "data" / "gammatone_envelopes.pkl"
+        search_pattern = "*wavlm*.pkl" if audio_rep == "wavlm" else "*gammatone*.pkl"
+        pkl_files = list(base_dir.rglob(search_pattern))
+        if not pkl_files:
+            pkl_files = list(base_dir.rglob("*.pkl"))
+            
+        if pkl_files:
+            env_file = pkl_files[0]
+        else:
+            default_name = "wavlm_features.pkl" if audio_rep == "wavlm" else "gammatone_envelopes.pkl"
+            env_file = REPO_ROOT / "data" / default_name
         
     print(f"Using map file: {map_file}")
     print(f"Using env file: {env_file}")
@@ -233,12 +238,11 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                 
     return n_correct, n_total
 
-def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False, use_dann=False, use_temporal_transport=False, file_disjoint=False):
-    torch.backends.cudnn.benchmark = True
+def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52], lowcut=1.0, highcut=6.0, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False, use_dann=False, use_temporal_transport=False, file_disjoint=False, audio_rep="gammatone", audio_env_file=""):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | MatchNet ({eeg_model}) | Channels: {channels}")
     
-    mapping, envelopes = get_mapping_data()
+    mapping, envelopes = get_mapping_data(audio_rep, audio_env_file)
     
     all_paths = subject_files()
     if not all_paths:
@@ -359,7 +363,15 @@ def train_matchnet_loso(eeg_model, channels, lowcut, highcut, batch_size=128, nu
             
         # Model
         num_subjects = len(train_paths)
-        model = ContrastiveMatchNet(eeg_model_type=eeg_model, eeg_channels=len(channels), audio_channels=NUM_BANDS, latent_dim=64, num_subjects=num_subjects, use_temporal_transport=use_temporal_transport).to(device)
+        audio_channels = 768 if audio_rep == "wavlm" else 28
+        model = ContrastiveMatchNet(
+            eeg_model_type=eeg_model, 
+            eeg_channels=len(channels), 
+            audio_channels=audio_channels,
+            latent_dim=64,
+            use_temporal_transport=use_temporal_transport,
+            audio_model_type=audio_rep
+        ).to(device)
         optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
         scaler = torch.cuda.amp.GradScaler()
         
@@ -570,6 +582,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_dann", action="store_true", help="Use Domain Adversarial Neural Network to enforce subject invariance")
     parser.add_argument("--use_temporal_transport", action="store_true", help="Enable Neural Temporal Deformation Field (Strategy 1) to biologically warp audio delays")
     parser.add_argument("--file_disjoint", action="store_true", help="Enforce strictly disjoint audio files between train and test sets")
+    parser.add_argument("--audio_rep", type=str, default="gammatone", choices=["gammatone", "wavlm"], help="Audio representation to use")
+    parser.add_argument("--audio_env_file", type=str, default="", help="Path to audio features pkl file (overrides default search)")
     args = parser.parse_args()
     
     train_matchnet_loso(
@@ -586,5 +600,7 @@ if __name__ == "__main__":
         augment_sign_flip=args.augment_sign_flip,
         use_dann=args.use_dann,
         use_temporal_transport=args.use_temporal_transport,
-        file_disjoint=args.file_disjoint
+        file_disjoint=args.file_disjoint,
+        audio_rep=args.audio_rep,
+        audio_env_file=args.audio_env_file
     )
