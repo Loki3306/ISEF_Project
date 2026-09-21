@@ -256,9 +256,10 @@ class ChunkDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         trial_idx, start, end = self.chunk_indices[idx]
         
-        x = torch.FloatTensor(self.X_full[trial_idx][:, start:end])
-        ya = torch.FloatTensor(self.YA_full[trial_idx][:, start:end])
-        yb = torch.FloatTensor(self.YB_full[trial_idx][:, start:end])
+        # Slicing a PyTorch tensor returns a view (zero memory allocation)
+        x = self.X_full[trial_idx][:, start:end].float()
+        ya = self.YA_full[trial_idx][:, start:end].float()
+        yb = self.YB_full[trial_idx][:, start:end].float()
         
         if self.Subj_full is not None:
             subj = torch.tensor(self.Subj_full[trial_idx], dtype=torch.long)
@@ -367,6 +368,11 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
 
         X_te_full, YA_te_full, YB_te_full = prepare_dataset(test_exs, channels, lowcut, highcut, held_out_path.stem, mapping, envelopes, audio_layer_idx=audio_layer_idx)
         
+        # Convert lists of numpy arrays to lists of PyTorch tensors to enable zero-copy slicing in __getitem__
+        X_tr_full = [torch.from_numpy(x) for x in X_tr_full]
+        YA_tr_full = [torch.from_numpy(x) for x in YA_tr_full]
+        YB_tr_full = [torch.from_numpy(x) for x in YB_tr_full]
+        
         # Chunk training data indices instead of copying arrays
         chunk_indices = []
         win_samples = int(TRAIN_WINDOW_SEC * FS)
@@ -384,24 +390,6 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
             train_dataset, 
             batch_size=batch_size, 
             shuffle=True, 
-            num_workers=num_workers,
-            pin_memory=True
-        )
-        
-        # Validation chunking
-        val_chunk_indices = []
-        for i in range(len(X_va_full)):
-            trial_len = X_va_full[i].shape[1]
-            start = 0
-            while start + win_samples <= trial_len:
-                val_chunk_indices.append((i, start, start + win_samples))
-                start += hop_samples
-                
-        val_dataset = ChunkDataset(X_va_full, YA_va_full, YB_va_full, val_chunk_indices, Subj_va_full if use_dann else None)
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
             num_workers=num_workers,
             pin_memory=True
         )
