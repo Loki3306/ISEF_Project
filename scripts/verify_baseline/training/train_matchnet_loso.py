@@ -238,6 +238,25 @@ def evaluate_model(model, X, Y_A, Y_B, device, window_sec=10, zero_eeg=False, sh
                 
     return n_correct, n_total
 
+class ChunkDataset(torch.utils.data.Dataset):
+    def __init__(self, X_list, YA_list, YB_list, Subj_list=None):
+        self.X = X_list
+        self.YA = YA_list
+        self.YB = YB_list
+        self.Subj = Subj_list
+        
+    def __len__(self):
+        return len(self.X)
+        
+    def __getitem__(self, idx):
+        x = torch.FloatTensor(self.X[idx])
+        ya = torch.FloatTensor(self.YA[idx])
+        yb = torch.FloatTensor(self.YB[idx])
+        if self.Subj is not None:
+            subj = torch.tensor(self.Subj[idx], dtype=torch.long)
+            return x, ya, yb, subj
+        return x, ya, yb
+
 def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 52], lowcut=1.0, highcut=6.0, batch_size=128, num_workers=2, subjects_to_run=None, loss_type="contrastive", lambda_align=0.5, align_target=0.1, augment_sign_flip=False, use_dann=False, use_temporal_transport=False, file_disjoint=False, audio_rep="gammatone", audio_env_file=""):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device} | MatchNet ({eeg_model}) | Channels: {channels}")
@@ -341,24 +360,18 @@ def train_matchnet_loso(eeg_model="eegnet", channels=[0, 33, 6, 41, 22, 59, 15, 
             X_tr.extend(cx); YA_tr.extend(cya); YB_tr.extend(cyb)
             Subj_tr.extend([Subj_tr_full[i]] * len(cx))
             
-        print("Converting to PyTorch Dataset and PRE-LOADING to VRAM...")
-        # Maximize GPU by sending the entire 3GB dataset directly to the 15GB VRAM
-        X_tr_t = torch.FloatTensor(np.stack(X_tr)).to(device)
-        YA_tr_t = torch.FloatTensor(np.stack(YA_tr)).to(device)
-        YB_tr_t = torch.FloatTensor(np.stack(YB_tr)).to(device)
-        Subj_tr_t = torch.LongTensor(Subj_tr).to(device)
-        
+        print("Converting to PyTorch Dataset (Lazy Loading to avoid OOM)...")
         if use_dann:
-            train_dataset = TensorDataset(X_tr_t, YA_tr_t, YB_tr_t, Subj_tr_t)
+            train_dataset = ChunkDataset(X_tr, YA_tr, YB_tr, Subj_tr)
         else:
-            train_dataset = TensorDataset(X_tr_t, YA_tr_t, YB_tr_t)
+            train_dataset = ChunkDataset(X_tr, YA_tr, YB_tr)
         
-        # When dataset is fully on GPU, num_workers MUST be 0
         train_loader = DataLoader(
             train_dataset, 
             batch_size=batch_size, 
             shuffle=True, 
-            num_workers=0
+            num_workers=num_workers,
+            pin_memory=True
         )
             
         # Model
