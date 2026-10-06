@@ -96,6 +96,68 @@ def evaluate_windows(model, eeg_list, ya_list, yb_list, window_samples, device):
     acc = (correct_wins / total_wins) * 100.0
     return acc, total_wins
 
+def adapt_subject_spatial(base_model, calib_eeg, calib_ya, calib_yb, win_samples, hop_samples, device, epochs=10, lr=2e-4):
+    """
+    Fine-tunes the 640 spatial projection + spatial BatchNorm parameters on calibration trials (trials 00-02)
+    to match the subject's physical skull impedance and electrode dipole orientation.
+    All multi-band temporal TCN blocks and cross-correlation classifier parameters remain strictly frozen.
+    """
+    model = deepcopy(base_model)
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in model.eeg_encoder.spatial_proj.parameters():
+        p.requires_grad = True
+    for p in model.eeg_encoder.bn_spatial.parameters():
+        p.requires_grad = True
+        
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
+    
+    X_cal, YA_cal, YB_cal = [], [], []
+    for eeg, ya, yb in zip(calib_eeg, calib_ya, calib_yb):
+        min_len = min(len(eeg), ya.shape[-1], yb.shape[-1])
+        x_t = eeg[:min_len].T if eeg.shape[0] >= eeg.shape[1] else eeg.T[:min_len]
+        start = 0
+        while start + win_samples <= min_len:
+            end = start + win_samples
+            X_cal.append(x_t[:, start:end])
+            YA_cal.append(ya[:, start:end])
+            YB_cal.append(yb[:, start:end])
+            start += hop_samples
+            
+    if not X_cal:
+        return model
+        
+    ds = TensorDataset(
+        torch.from_numpy(np.stack(X_cal, axis=0)).float(),
+        torch.from_numpy(np.stack(YA_cal, axis=0)).float(),
+        torch.from_numpy(np.stack(YB_cal, axis=0)).float()
+    )
+    loader = DataLoader(ds, batch_size=min(32, len(ds)), shuffle=True)
+    
+    # Strictly preserve frozen BatchNorm statistics in TCN and audio encoders
+    model.eval()
+    model.eeg_encoder.spatial_proj.train()
+    model.eeg_encoder.bn_spatial.train()
+    
+    for _ in range(epochs):
+        for bx, bya, byb in loader:
+            bx, bya, byb = bx.to(device), bya.to(device), byb.to(device)
+            swap = torch.rand(bx.size(0), device=device) > 0.5
+            c1 = torch.where(swap[:, None, None], byb, bya)
+            c2 = torch.where(swap[:, None, None], bya, byb)
+            target_sign = torch.where(swap, -1.0, 1.0)
+            
+            optimizer.zero_grad(set_to_none=True)
+            delta, (l1, l2), _ = model(bx, c1, c2)
+            loss = torch.clamp(0.5 - target_sign * delta, min=0.0).mean()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            optimizer.step()
+            
+    model.eval()
+    return model
+
 def discover_eeg_subjects(custom_eeg_dir: str = None) -> list[Path]:
     """Discovers all DTU S*_data_preproc.mat files with exhaustive error-tolerant search."""
     found_paths = set()
@@ -302,6 +364,7 @@ def run_multiband_training(args):
             
         split_idx = int(math.floor(n_valid * (1.0 - args.test_split)))
         sub_eeg_te, sub_ya_te, sub_yb_te = [], [], []
+        sub_eeg_cal, sub_ya_cal, sub_yb_cal = [], [], []
         
         for idx in range(n_valid):
             raw_eeg = exs[idx].eeg[:, montage_channels].astype(np.float32)
@@ -329,6 +392,12 @@ def run_multiband_training(args):
                 x_t = eeg_c.T # [C_eeg, T]
                 is_val_trial = (idx % 10 == 0)
                 
+                # First 3 trials preserved as calibration set for few-shot spatial adaptation
+                if idx < 3:
+                    sub_eeg_cal.append(eeg_c)
+                    sub_ya_cal.append(ya_c)
+                    sub_yb_cal.append(yb_c)
+                
                 # Chunk training trials
                 hop_samples = int(args.hop_sec * FS)
                 start = 0
@@ -354,7 +423,7 @@ def run_multiband_training(args):
                 sub_yb_te.append(yb_c)
                 
         if sub_eeg_te:
-            subject_test_data[sub_name] = (sub_eeg_te, sub_ya_te, sub_yb_te)
+            subject_test_data[sub_name] = (sub_eeg_te, sub_ya_te, sub_yb_te, sub_eeg_cal, sub_ya_cal, sub_yb_cal)
             
     print(f"[DATA READY]: Extracted {len(X_tr_list)} train windows, {len(X_va_list)} val windows across {total_train_trials} trials in {time.time()-t_data_start:.1f}s.")
     
@@ -411,10 +480,11 @@ def run_multiband_training(args):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\n[MODEL INITIALIZED]: MultiBand-CATCN with {n_params:,} trainable parameters.")
     
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
     scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
     
+    best_val_acc = 0.0
     best_val_loss = float('inf')
     best_weights = deepcopy(model.state_dict())
     
@@ -435,6 +505,14 @@ def run_multiband_training(args):
             bx = bx.to(device, non_blocking=True)
             bya = bya.to(device, non_blocking=True)
             byb = byb.to(device, non_blocking=True)
+            
+            # Subband SpecAugment (mask 1 random band with p=args.subband_mask_prob to prevent relying on single subband noise)
+            if args.subband_mask_prob > 0 and np.random.rand() < args.subband_mask_prob:
+                mb = np.random.randint(0, args.audio_bands)
+                bya = bya.clone()
+                byb = byb.clone()
+                bya[:, mb, :] = 0.0
+                byb[:, mb, :] = 0.0
             
             # Symmetrized anti-biased candidate stream swapping
             swap = torch.rand(bx.size(0), device=device) > 0.5
@@ -484,11 +562,13 @@ def run_multiband_training(args):
         val_acc = (val_correct / max(1, n_val_samples)) * 100.0
         epoch_sec = time.time() - t_epoch_start
         
-        is_best = avg_val_loss < best_val_loss
+        # Checkpoint Criterion: Prioritize Validation 2AFC Accuracy over uncalibrated margin loss
+        is_best = (val_acc > best_val_acc) or (abs(val_acc - best_val_acc) < 1e-4 and avg_val_loss < best_val_loss)
         if is_best:
+            best_val_acc = val_acc
             best_val_loss = avg_val_loss
             best_weights = deepcopy(model.state_dict())
-            star_flag = " [*BEST*]"
+            star_flag = f" [*BEST Acc: {val_acc:5.1f}%*]"
         else:
             star_flag = ""
             
@@ -499,36 +579,65 @@ def run_multiband_training(args):
             torch.save(best_weights, ckpt_path)
             
     # 6. Final Evaluation on Held-Out Test Split
-    print("\n" + "=" * 96)
-    print("  GRAND COHORT EVALUATION ON HELD-OUT TRIALS (5.0s NON-OVERLAPPING WINDOWS)")
-    print("=" * 96)
+    print("\n" + "=" * 108)
+    print("  GRAND COHORT EVALUATION ON HELD-OUT TRIALS (MULTI-SCALE 5.0s, 10.0s, 20.0s)")
+    print("=" * 108)
     model.load_state_dict(best_weights)
     model.eval()
     
     subject_results = {}
-    cohort_accs = []
+    cohort_accs_5s = []
+    cohort_accs_10s = []
+    cohort_accs_20s = []
     
-    print(f"  {'Subject':<16} | {'2AFC Accuracy':<14} | {'Baseline (5s)':<14} | {'Gain / Margin':<14} | {'Test Wins':<10}")
-    print("  " + "-" * 76)
-    for sub_name, (te_eeg, te_ya, te_yb) in subject_test_data.items():
-        acc, n_wins = evaluate_windows(model, te_eeg, te_ya, te_yb, win_samples, device)
+    win_5s_smp = int(5.0 * FS)
+    win_10s_smp = int(10.0 * FS)
+    win_20s_smp = int(20.0 * FS)
+    
+    print(f"  {'Subject':<16} | {'Zero-Shot(5s)':<14} | {'Adapted(5s)':<12} | {'10.0s Acc':<10} | {'20.0s Acc':<10} | {'Baseline(5s)':<13} | {'Gain(5s)':<10} | {'Wins(5s)':<8}")
+    print("  " + "-" * 104)
+    for sub_name, (te_eeg, te_ya, te_yb, cal_eeg, cal_ya, cal_yb) in subject_test_data.items():
+        zero_acc, n_wins_5s = evaluate_windows(model, te_eeg, te_ya, te_yb, win_5s_smp, device)
+        if args.adapt and cal_eeg:
+            eval_model = adapt_subject_spatial(
+                model, cal_eeg, cal_ya, cal_yb, win_5s_smp, int(args.hop_sec * FS), device,
+                epochs=args.calib_epochs, lr=args.calib_lr
+            )
+            adapt_acc_5s, _ = evaluate_windows(eval_model, te_eeg, te_ya, te_yb, win_5s_smp, device)
+        else:
+            eval_model = model
+            adapt_acc_5s = zero_acc
+            
+        adapt_acc_10s, _ = evaluate_windows(eval_model, te_eeg, te_ya, te_yb, win_10s_smp, device)
+        adapt_acc_20s, _ = evaluate_windows(eval_model, te_eeg, te_ya, te_yb, win_20s_smp, device)
+            
         s_key = sub_name.split("_")[0].upper()
         base_acc = BASELINE_5S.get(s_key, 65.7)
-        gain = acc - base_acc
+        gain = adapt_acc_5s - base_acc
         gain_str = f"+{gain:.2f}%" if gain >= 0 else f"{gain:.2f}%"
         subject_results[sub_name] = {
-            "accuracy": round(acc, 2),
+            "zero_shot_5s": round(zero_acc, 2),
+            "adapted_5s": round(adapt_acc_5s, 2),
+            "adapted_10s": round(adapt_acc_10s, 2),
+            "adapted_20s": round(adapt_acc_20s, 2),
             "baseline_5s": round(base_acc, 2),
-            "gain": round(gain, 2),
-            "test_windows": n_wins
+            "gain_5s": round(gain, 2),
+            "test_windows_5s": n_wins_5s
         }
-        cohort_accs.append(acc)
-        print(f"  {sub_name:<16} | {acc:5.1f}%          | {base_acc:5.1f}%         | {gain_str:<14} | {n_wins:<10}")
+        cohort_accs_5s.append(adapt_acc_5s)
+        cohort_accs_10s.append(adapt_acc_10s)
+        cohort_accs_20s.append(adapt_acc_20s)
+        print(f"  {sub_name:<16} | {zero_acc:5.1f}%         | {adapt_acc_5s:5.1f}%       | {adapt_acc_10s:5.1f}%     | {adapt_acc_20s:5.1f}%     | {base_acc:5.1f}%        | {gain_str:<10} | {n_wins_5s:<8}")
         
-    grand_mean = float(np.mean(cohort_accs)) if cohort_accs else 0.0
-    print("-" * 96)
-    print(f"  COHORT EVALUATION MEAN ACCURACY: {grand_mean:.2f}% across {len(subject_results)} subjects")
-    print("=" * 96)
+    mean_5s = float(np.mean(cohort_accs_5s)) if cohort_accs_5s else 0.0
+    mean_10s = float(np.mean(cohort_accs_10s)) if cohort_accs_10s else 0.0
+    mean_20s = float(np.mean(cohort_accs_20s)) if cohort_accs_20s else 0.0
+    print("-" * 108)
+    print(f"  GRAND COHORT MEAN ACCURACIES across {len(subject_results)} subjects:")
+    print(f"    •  5.0s Window 2AFC Accuracy:  {mean_5s:.2f}% (Canonical Single-Band Baseline: 65.7%)")
+    print(f"    • 10.0s Window 2AFC Accuracy:  {mean_10s:.2f}% (Canonical Single-Band Baseline: 74.1%)")
+    print(f"    • 20.0s Window 2AFC Accuracy:  {mean_20s:.2f}% (Canonical Single-Band Baseline: 79.6%)")
+    print("=" * 108)
     
     # Save Metrics JSON
     metrics = {
@@ -538,8 +647,11 @@ def run_multiband_training(args):
         "audio_bands": args.audio_bands,
         "epochs": args.epochs,
         "parameters": n_params,
+        "best_val_acc": round(best_val_acc, 2),
         "best_val_loss": round(best_val_loss, 4),
-        "grand_mean_accuracy": round(grand_mean, 2),
+        "mean_5s_accuracy": round(mean_5s, 2),
+        "mean_10s_accuracy": round(mean_10s, 2),
+        "mean_20s_accuracy": round(mean_20s, 2),
         "subject_accuracies": subject_results,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
@@ -550,26 +662,30 @@ def run_multiband_training(args):
     print(f"[OUTPUT] Metrics saved to: {metrics_path}\n")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Multi-Band Cochlear Gammatone + Causal ERP Cross-Attention CA-TCN Training")
+    parser = argparse.ArgumentParser(description="Multi-Band Cochlear Gammatone + CA-TCN Training")
     parser.add_argument("--montage", type=str, default="dtu_8ch", choices=list(MONTAGES.keys()))
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--window_sec", type=float, default=5.0)
     parser.add_argument("--hop_sec", type=float, default=1.0)
     parser.add_argument("--test_split", type=float, default=0.2)
     parser.add_argument("--audio_bands", type=int, default=8)
     parser.add_argument("--hidden_dim", type=int, default=64)
-    parser.add_argument("--num_heads", type=int, default=4)
-    parser.add_argument("--max_erp_samples", type=int, default=22)
     parser.add_argument("--max_lag_samples", type=int, default=8)
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--dropout", type=float, default=0.35)
+    parser.add_argument("--subband_mask_prob", type=float, default=0.25)
+    parser.add_argument("--adapt", action="store_true", default=True, help="Enable few-shot spatial adaptation")
+    parser.add_argument("--no_adapt", action="store_false", dest="adapt", help="Disable few-shot spatial adaptation")
+    parser.add_argument("--calib_epochs", type=int, default=10, help="Few-shot spatial calibration epochs")
+    parser.add_argument("--calib_lr", type=float, default=2e-4, help="Learning rate for spatial calibration")
     parser.add_argument("--eeg_dir", type=str, default=None)
     parser.add_argument("--audio_dir", type=str, default=None)
     parser.add_argument("--audio_env_file", type=str, default=None)
     parser.add_argument("--output_model", type=str, default="/kaggle/working/multiband_catcn_best.pt")
     parser.add_argument("--output_metrics", type=str, default="/kaggle/working/multiband_catcn_metrics.json")
     parser.add_argument("--smoke_test", action="store_true", help="Run rapid CPU smoke test")
-    parser.add_argument("--subjects", type=str, default=None, help="Comma-separated subjects to run, e.g. S15,S6,S1,S14")
+    parser.add_argument("--subjects", type=str, default=None, help="Comma-separated subjects to run, or 'all'")
     args = parser.parse_args()
     run_multiband_training(args)
