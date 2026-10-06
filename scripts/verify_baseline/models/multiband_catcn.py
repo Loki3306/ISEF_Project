@@ -1,15 +1,22 @@
 """
-Multi-Band Cochlear Gammatone + Causal ERP Cross-Attention CA-TCN.
-Reference Architecture: arXiv:2603.26394 + Tonotopic Cochlear Cross-Attention.
+Multi-Band Cochlear Gammatone + Causal ERP Cross-Attention CA-TCN (Sinc-CATCN v2).
+Reference Architecture: arXiv:2603.26394 + Biological SincNet Front-End + Bilinear Cross-Attention.
 
-Key Upgrades over Standard CA-TCN:
-1. Multi-Band Stimulus Encoding: Replaces 1D collapsed envelope with 8 ERB cochlear subbands,
-   preserving tonotopic cortical representation along the superior temporal gyrus.
-2. Causal ERP Cross-Attention: Dynamic temporal alignment head with physiological
-   latency masking (tau in [0, 344 ms], strictly forbidding future audio leakage).
-3. Residual Normalized Cross-Correlation Skip Connection: Guarantees performance
-   is strictly lower-bounded by baseline CA-TCN.
-4. Strict Anti-Symmetry: Delta(A, B) = -Delta(B, A) mathematically guaranteed.
+Key Innovations:
+1. Biological SincNet Filterbank (SincConvEEG):
+   Parameterized 1D sinc temporal bandpass filters initialized to 8 canonical EEG neural
+   rhythms (Delta 0.5-4 Hz, Theta 4-8 Hz, Alpha 8-13 Hz, Beta 13-30 Hz) with Hamming windowing.
+   Decomposes scalp EEG into true neural oscillation bands matching cochlear tonotopic subbands.
+2. Spatial-Spectral Beamformer:
+   Depthwise spatial combination mixing multi-channel electrodes across biological rhythms
+   to extract auditory cortical dipole sources (Heschl's gyrus / Superior Temporal Gyrus).
+3. Bilinear Multi-Band Cross-Attention Head:
+   Cross-spectral latent projection matching acoustic subbands with cortical neural rhythms.
+4. Physiological Causal ERP Latency Window:
+   Focused latency window tau in [-2, +18] samples (-31 ms to +281 ms), directly targeting
+   the cortical N100 and P200 auditory evoked potentials while suppressing non-physiological noise.
+5. Strict Anti-Symmetry & Zero Shortcut Leakage:
+   Delta(A, B) = -Delta(B, A) mathematically exact. No independent audio feature shortcuts.
 """
 
 from __future__ import annotations
@@ -64,44 +71,102 @@ class DepthwiseSeparableTCNBlock(nn.Module):
         out = self.dropout(out)
         return F.elu(out + res)
 
-class CATCN_MultiBandAudioEncoder(nn.Module):
+class SincConvEEG(nn.Module):
     """
-    Causal Multi-Band Cochlear Stimulus Encoder.
-    Processes N_bands (default 8) Gammatone subbands into hidden representations.
-    Strictly CAUSAL with receptive field = 1 + 2 * (1 + 2 + 4 + 8 + 16) = 63 samples (984.4 ms at 64 Hz).
+    Parameterized Biological SincNet Filterbank for Scalp EEG.
+    Extracts 8 physiological neural oscillation bands (Delta, Theta, Alpha, Beta)
+    directly parameterized by learnable lower cutoff frequencies and bandwidths.
     """
-    def __init__(self, in_channels: int = 8, hidden_dim: int = 64, dilations: list[int] = [1, 2, 4, 8, 16], dropout: float = 0.2):
+    def __init__(self, out_bands: int = 8, kernel_size: int = 65, sample_rate: float = 64.0):
         super().__init__()
-        self.in_channels = in_channels
-        self.hidden_dim = hidden_dim
+        self.out_bands = out_bands
+        self.kernel_size = kernel_size if kernel_size % 2 != 0 else kernel_size + 1
+        self.sample_rate = sample_rate
+        self.nyquist = sample_rate / 2.0
         
-        # 1x1 spectral projection from N cochlear subbands to hidden channels
-        self.spectral_proj = nn.Conv1d(in_channels, hidden_dim, kernel_size=1, bias=False)
-        self.bn_proj = nn.BatchNorm1d(hidden_dim)
+        # 8 Canonical Biological EEG Bands:
+        # 1. Low Delta (0.5 - 2.0 Hz) - Phrase/prosodic tracking
+        # 2. High Delta (2.0 - 4.0 Hz) - Syllable grouping
+        # 3. Low Theta (4.0 - 6.0 Hz) - Acoustic syllable boundaries
+        # 4. High Theta (6.0 - 8.0 Hz) - Phonemic envelope rate
+        # 5. Low Alpha (8.0 - 10.5 Hz) - Auditory attentional gating
+        # 6. High Alpha (10.5 - 13.0 Hz) - Parietal alpha suppression
+        # 7. Low Beta (13.0 - 20.0 Hz) - Temporal prediction
+        # 8. Mid Beta (20.0 - 30.0 Hz) - Motor/auditory integration
+        f1_init_hz = torch.tensor([0.5, 2.0, 4.0, 6.0, 8.0, 10.5, 13.0, 20.0])
+        f2_init_hz = torch.tensor([2.0, 4.0, 6.0, 8.0, 10.5, 13.0, 20.0, 30.0])
+        band_init_hz = f2_init_hz - f1_init_hz
         
-        self.blocks = nn.ModuleList([
-            DepthwiseSeparableTCNBlock(
-                channels=hidden_dim, kernel_size=3, dilation=d, direction='causal', dropout=dropout
-            )
-            for d in dilations
-        ])
+        self.min_low_hz = 0.2
+        self.min_band_hz = 1.0
+        
+        f1_norm = (f1_init_hz - self.min_low_hz) / (self.nyquist - self.min_low_hz - self.min_band_hz + 1e-6)
+        f1_norm = torch.clamp(f1_norm, 1e-4, 1.0 - 1e-4)
+        self.f1_raw = nn.Parameter(torch.log(f1_norm / (1.0 - f1_norm)))
+        
+        band_norm = (band_init_hz - self.min_band_hz) / (self.nyquist - f1_init_hz - self.min_band_hz + 1e-6)
+        band_norm = torch.clamp(band_norm, 1e-4, 1.0 - 1e-4)
+        self.band_raw = nn.Parameter(torch.log(band_norm / (1.0 - band_norm)))
+        
+        # Symmetric Hamming window
+        n = torch.linspace(0, self.kernel_size - 1, self.kernel_size)
+        window = 0.54 - 0.46 * torch.cos(2 * math.pi * n / (self.kernel_size - 1))
+        self.register_buffer('window', window)
+        
+        t_right = torch.linspace(1, (self.kernel_size - 1) / 2, steps=int((self.kernel_size - 1) / 2))
+        self.register_buffer('t_right', t_right)
+        
+    def get_bands(self):
+        range_f1 = self.nyquist - self.min_low_hz - self.min_band_hz
+        f1 = self.min_low_hz + range_f1 * torch.sigmoid(self.f1_raw)
+        range_band = self.nyquist - f1 - self.min_band_hz
+        band = self.min_band_hz + range_band * torch.sigmoid(self.band_raw)
+        return f1 / self.sample_rate, (f1 + band) / self.sample_rate, band / self.sample_rate
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, in_channels, T]
-        feat = F.elu(self.bn_proj(self.spectral_proj(x)))
-        for block in self.blocks:
-            feat = block(feat)
-        return feat
+        # x: [B, C, T]
+        B, C, T = x.shape
+        f1, f2, band = self.get_bands()
+        t = self.t_right
+        
+        f1_2pi_t = 2 * math.pi * f1.view(-1, 1) * t.view(1, -1)
+        f2_2pi_t = 2 * math.pi * f2.view(-1, 1) * t.view(1, -1)
+        
+        low_pass1 = torch.sin(f1_2pi_t) / (math.pi * t.view(1, -1))
+        low_pass2 = torch.sin(f2_2pi_t) / (math.pi * t.view(1, -1))
+        
+        band_pass_right = low_pass2 - low_pass1
+        band_pass_center = 2 * band.view(-1, 1)
+        band_pass_left = torch.flip(band_pass_right, dims=[1])
+        band_pass = torch.cat([band_pass_left, band_pass_center, band_pass_right], dim=1)
+        band_pass = band_pass * self.window.view(1, -1)
+        
+        filters = band_pass.view(self.out_bands, 1, 1, self.kernel_size)
+        pad = (self.kernel_size - 1) // 2
+        # Apply filterbank across all electrodes simultaneously: [B, 1, C, T] -> [B, out_bands, C, T]
+        out = F.conv2d(x.unsqueeze(1), filters, padding=(0, pad))
+        return out.view(B, self.out_bands * C, T)
 
-class CATCN_EEGEncoder(nn.Module):
+class SincCATCN_EEGEncoder(nn.Module):
     """
-    Anticausal EEG Neural Encoder.
-    Processes raw multi-channel scalp EEG into hidden representations.
-    Strictly ANTICAUSAL with receptive field = 1 + 2 * (1 + 2 + 4) = 15 samples (234.4 ms at 64 Hz).
+    Biological Sinc-Anticausal EEG Neural Encoder.
+    Applies Sinc filterbank to decompose each electrode into 8 biological rhythms,
+    followed by spatial dipole beamforming and anticausal TCN blocks.
+    Receptive Field: ~234 ms future anticausal + 1015 ms biological sinc context.
     """
-    def __init__(self, in_channels: int = 64, hidden_dim: int = 64, dilations: list[int] = [1, 2, 4], dropout: float = 0.2):
+    def __init__(
+        self,
+        in_channels: int = 8,
+        hidden_dim: int = 64,
+        sinc_bands: int = 8,
+        dilations: list[int] = [1, 2, 4],
+        dropout: float = 0.2
+    ):
         super().__init__()
-        self.spatial_proj = nn.Conv1d(in_channels, hidden_dim, kernel_size=1, bias=False)
+        self.in_channels = in_channels
+        self.sinc_bands = sinc_bands
+        self.sinc_filter = SincConvEEG(out_bands=sinc_bands, kernel_size=65, sample_rate=64.0)
+        self.spatial_proj = nn.Conv1d(in_channels * sinc_bands, hidden_dim, kernel_size=1, bias=False)
         self.bn_spatial = nn.BatchNorm1d(hidden_dim)
         
         self.blocks = nn.ModuleList([
@@ -112,35 +177,73 @@ class CATCN_EEGEncoder(nn.Module):
         ])
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C_eeg, T]
-        feat = F.elu(self.bn_spatial(self.spatial_proj(x)))
+        # x: [B, in_channels, T]
+        sinc_feats = self.sinc_filter(x) # [B, in_channels * sinc_bands, T]
+        feat = F.elu(self.bn_spatial(self.spatial_proj(sinc_feats)))
         for block in self.blocks:
             feat = block(feat)
         return feat
 
-class CrossCorrelationClassificationHead(nn.Module):
+class SincCATCN_AudioEncoder(nn.Module):
+    """
+    Causal Multi-Band Cochlear Stimulus Encoder with Bilinear Latent Projection.
+    Processes N_bands (Broadband + 8 Gammatone subbands) into hidden cortical representations.
+    Strictly CAUSAL with receptive field = 63 samples (984.4 ms at 64 Hz).
+    """
+    def __init__(
+        self,
+        in_channels: int = 9,
+        hidden_dim: int = 64,
+        dilations: list[int] = [1, 2, 4, 8, 16],
+        dropout: float = 0.2
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.hidden_dim = hidden_dim
+        
+        self.spectral_proj = nn.Conv1d(in_channels, hidden_dim, kernel_size=1, bias=False)
+        self.bn_proj = nn.BatchNorm1d(hidden_dim)
+        
+        self.blocks = nn.ModuleList([
+            DepthwiseSeparableTCNBlock(
+                channels=hidden_dim, kernel_size=3, dilation=d, direction='causal', dropout=dropout
+            )
+            for d in dilations
+        ])
+        
+        # Bilinear cross-channel latent projection from Audio into Cortical EEG space
+        self.latent_proj = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False)
+        self.bn_latent = nn.BatchNorm1d(hidden_dim)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = F.elu(self.bn_proj(self.spectral_proj(x)))
+        for block in self.blocks:
+            feat = block(feat)
+        out = F.elu(self.bn_latent(self.latent_proj(feat)))
+        return out
+
+class BilinearCrossCorrelationHead(nn.Module):
     """
     Normalized Multi-Lag Cross-Correlation Head with Guaranteed Anti-Symmetry.
-    Computes normalized cross-correlation across temporal lags tau in [-max_lag_samples, +max_lag_samples],
+    Computes normalized cross-correlations across temporal lags tau in [min_lag, max_lag],
     then passes the concatenated correlation coefficients to a linear classifier without bias.
     
     Guarantees:
     1. Zero Data Leakage: Purely bilinear dot-product between temporally standardized EEG and Audio.
-       Independent audio features (speech pitch, volume, speaker gender) cannot produce a positive score.
     2. Strict Anti-Symmetry: Delta(A, B) = -Delta(B, A).
-    3. Direct Lower-Bound Equivalence with Baseline CA-TCN (arXiv:2603.26394).
+    3. Physiological ERP Focus: Focuses on physiological causal delays (N100, P200).
     """
-    def __init__(self, hidden_dim: int = 64, max_lag_samples: int = 8):
+    def __init__(self, hidden_dim: int = 64, min_lag: int = -2, max_lag: int = 18):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.max_lag = max_lag_samples
-        self.num_lags = 2 * max_lag_samples + 1
+        self.min_lag = min_lag
+        self.max_lag = max_lag
+        self.num_lags = max_lag - min_lag + 1
         self.classifier = nn.Linear(hidden_dim * self.num_lags, 1, bias=False)
         
     def compute_cross_correlation(self, z_eeg: torch.Tensor, z_audio: torch.Tensor) -> torch.Tensor:
         B, D, T = z_eeg.shape
         
-        # Standardize along temporal dimension (zero mean, unit variance per channel)
         ze_mean = z_eeg.mean(dim=-1, keepdim=True)
         ze_std = z_eeg.std(dim=-1, keepdim=True) + 1e-8
         ze_norm = (z_eeg - ze_mean) / ze_std
@@ -150,7 +253,7 @@ class CrossCorrelationClassificationHead(nn.Module):
         za_norm = (z_audio - za_mean) / za_std
         
         corrs = []
-        for tau in range(-self.max_lag, self.max_lag + 1):
+        for tau in range(self.min_lag, self.max_lag + 1):
             if tau > 0:
                 ze_slice = ze_norm[:, :, tau:]
                 za_slice = za_norm[:, :, :-tau]
@@ -178,18 +281,20 @@ class CrossCorrelationClassificationHead(nn.Module):
         delta = logit_a - logit_b
         return delta, (logit_a, logit_b)
 
-class MultiBandCATCNDecoder(nn.Module):
+class SincMultiBandCATCNDecoder(nn.Module):
     """
-    Complete Multi-Band Cochlear Gammatone + CA-TCN Decoder.
-    Integrates 8-subband ERB tonotopic cochlear representation with causal-anticausal TCN
-    and multi-lag normalized cross-correlation classification.
+    Sinc-Biologic Multi-Band Cochlear Gammatone + CA-TCN Decoder (v2).
+    Integrates 8-band Biological SincNet EEG filtering, Causal multi-band cochlear TCN,
+    and Bilinear multi-lag ERP cross-correlation classification.
     """
     def __init__(
         self,
         eeg_channels: int = 8,
-        audio_bands: int = 8,
+        audio_bands: int = 9,
         hidden_dim: int = 64,
-        max_lag_samples: int = 8,
+        sinc_bands: int = 8,
+        min_lag: int = -2,
+        max_lag: int = 18,
         dropout: float = 0.2
     ):
         super().__init__()
@@ -197,21 +302,23 @@ class MultiBandCATCNDecoder(nn.Module):
         self.audio_bands = audio_bands
         self.hidden_dim = hidden_dim
         
-        self.audio_encoder = CATCN_MultiBandAudioEncoder(
+        self.eeg_encoder = SincCATCN_EEGEncoder(
+            in_channels=eeg_channels,
+            hidden_dim=hidden_dim,
+            sinc_bands=sinc_bands,
+            dilations=[1, 2, 4],
+            dropout=dropout
+        )
+        self.audio_encoder = SincCATCN_AudioEncoder(
             in_channels=audio_bands,
             hidden_dim=hidden_dim,
             dilations=[1, 2, 4, 8, 16],
             dropout=dropout
         )
-        self.eeg_encoder = CATCN_EEGEncoder(
-            in_channels=eeg_channels,
+        self.classifier_head = BilinearCrossCorrelationHead(
             hidden_dim=hidden_dim,
-            dilations=[1, 2, 4],
-            dropout=dropout
-        )
-        self.classifier_head = CrossCorrelationClassificationHead(
-            hidden_dim=hidden_dim,
-            max_lag_samples=max_lag_samples
+            min_lag=min_lag,
+            max_lag=max_lag
         )
         
     def forward(
@@ -220,16 +327,6 @@ class MultiBandCATCNDecoder(nn.Module):
         audio_a: torch.Tensor,
         audio_b: torch.Tensor
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """
-        eeg: [B, C_eeg, T]
-        audio_a: [B, audio_bands, T]
-        audio_b: [B, audio_bands, T]
-        
-        Returns:
-          delta: logit_a - logit_b
-          (logit_a, logit_b)
-          (z_eeg, z_a, z_b)
-        """
         z_eeg = self.eeg_encoder(eeg)
         z_a = self.audio_encoder(audio_a)
         z_b = self.audio_encoder(audio_b)
@@ -237,17 +334,92 @@ class MultiBandCATCNDecoder(nn.Module):
         delta, (logit_a, logit_b) = self.classifier_head(z_eeg, z_a, z_b)
         return delta, (logit_a, logit_b), (z_eeg, z_a, z_b)
 
+# Legacy v1 baseline classes preserved for full backward compatibility
+try:
+    from models.frozen_multiband_catcn import (
+        CATCN_EEGEncoder as CATCN_EEGEncoder_Baseline,
+        CATCN_MultiBandAudioEncoder as CATCN_MultiBandAudioEncoder_Baseline,
+        CrossCorrelationClassificationHead as CrossCorrelationClassificationHead_Baseline,
+        FrozenMultiBandCATCNDecoder as MultiBandCATCNDecoder_Baseline
+    )
+except ImportError:
+    try:
+        from .frozen_multiband_catcn import (
+            CATCN_EEGEncoder as CATCN_EEGEncoder_Baseline,
+            CATCN_MultiBandAudioEncoder as CATCN_MultiBandAudioEncoder_Baseline,
+            CrossCorrelationClassificationHead as CrossCorrelationClassificationHead_Baseline,
+            FrozenMultiBandCATCNDecoder as MultiBandCATCNDecoder_Baseline
+        )
+    except ImportError:
+        from frozen_multiband_catcn import (
+            CATCN_EEGEncoder as CATCN_EEGEncoder_Baseline,
+            CATCN_MultiBandAudioEncoder as CATCN_MultiBandAudioEncoder_Baseline,
+            CrossCorrelationClassificationHead as CrossCorrelationClassificationHead_Baseline,
+            FrozenMultiBandCATCNDecoder as MultiBandCATCNDecoder_Baseline
+        )
+
+class MultiBandCATCNDecoder(nn.Module):
+    """
+    Unified MultiBand CA-TCN Decoder interface.
+    Instantiates SincMultiBandCATCNDecoder by default (use_sinc=True)
+    or FrozenMultiBandCATCNDecoder (use_sinc=False) for exact legacy reproducibility.
+    """
+    def __init__(
+        self,
+        eeg_channels: int = 8,
+        audio_bands: int = 8,
+        hidden_dim: int = 64,
+        max_lag_samples: int = 8,
+        min_lag_samples: int = -2,
+        dropout: float = 0.2,
+        use_sinc: bool = True
+    ):
+        super().__init__()
+        self.use_sinc = use_sinc
+        if use_sinc:
+            self.model = SincMultiBandCATCNDecoder(
+                eeg_channels=eeg_channels,
+                audio_bands=audio_bands,
+                hidden_dim=hidden_dim,
+                min_lag=min_lag_samples,
+                max_lag=max_lag_samples,
+                dropout=dropout
+            )
+        else:
+            self.model = MultiBandCATCNDecoder_Baseline(
+                eeg_channels=eeg_channels,
+                audio_bands=audio_bands,
+                hidden_dim=hidden_dim,
+                max_lag_samples=max_lag_samples,
+                dropout=dropout
+            )
+            
+    # Forward properties to internal model for adaptation access
+    @property
+    def eeg_encoder(self):
+        return self.model.eeg_encoder
+        
+    @property
+    def audio_encoder(self):
+        return self.model.audio_encoder
+        
+    @property
+    def classifier_head(self):
+        return self.model.classifier_head
+        
+    def forward(self, eeg, audio_a, audio_b):
+        return self.model(eeg, audio_a, audio_b)
+
 def print_summary():
-    model = MultiBandCATCNDecoder(eeg_channels=8, audio_bands=8, hidden_dim=64)
+    model = MultiBandCATCNDecoder(eeg_channels=8, audio_bands=9, hidden_dim=64, use_sinc=True)
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"MultiBand-CATCN (8ch EEG, 8-band Audio) Parameter Count: {params:,}")
+    print(f"SincMultiBand-CATCN (8ch EEG, 9-band Audio) Parameter Count: {params:,}")
     model.eval()
     dummy_eeg = torch.randn(2, 8, 320)
-    dummy_a = torch.randn(2, 8, 320)
-    dummy_b = torch.randn(2, 8, 320)
+    dummy_a = torch.randn(2, 9, 320)
+    dummy_b = torch.randn(2, 9, 320)
     delta, (la, lb), (ze, za, zb) = model(dummy_eeg, dummy_a, dummy_b)
     print(f"Output shapes: delta={delta.shape}, la={la.shape}, ze={ze.shape}, za={za.shape}")
-    # Anti-symmetry assertion
     delta_rev, _, _ = model(dummy_eeg, dummy_b, dummy_a)
     diff = torch.max(torch.abs(delta + delta_rev)).item()
     print(f"Anti-symmetry check in eval mode (max |delta(A,B) + delta(B,A)|): {diff:.2e}")

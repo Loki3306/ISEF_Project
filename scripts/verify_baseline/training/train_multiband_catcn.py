@@ -20,6 +20,7 @@ import numpy as np
 from scipy import signal
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -96,11 +97,14 @@ def evaluate_windows(model, eeg_list, ya_list, yb_list, window_samples, device):
     acc = (correct_wins / total_wins) * 100.0
     return acc, total_wins
 
-def adapt_subject_spatial(base_model, calib_eeg, calib_ya, calib_yb, win_samples, hop_samples, device, epochs=10, lr=2e-4):
+def adapt_subject_spatial(
+    base_model, calib_eeg, calib_ya, calib_yb, win_samples, hop_samples, device,
+    epochs=10, lr=2e-4, loss_type="softplus", loss_temp=0.5, margin=0.5
+):
     """
-    Fine-tunes the 640 spatial projection + spatial BatchNorm parameters on calibration trials (trials 00-02)
-    to match the subject's physical skull impedance and electrode dipole orientation.
-    All multi-band temporal TCN blocks and cross-correlation classifier parameters remain strictly frozen.
+    Fine-tunes the spatial projection + spatial BatchNorm parameters on calibration trials (trials 00-02)
+    to match the subject's physical skull impedance, individual frequency resonance, and electrode dipole orientation.
+    All multi-band temporal TCN blocks, biological Sinc filters, and cross-correlation classifier parameters remain strictly frozen.
     """
     model = deepcopy(base_model)
     for p in model.parameters():
@@ -150,7 +154,10 @@ def adapt_subject_spatial(base_model, calib_eeg, calib_ya, calib_yb, win_samples
             
             optimizer.zero_grad(set_to_none=True)
             delta, (l1, l2), _ = model(bx, c1, c2)
-            loss = torch.clamp(0.5 - target_sign * delta, min=0.0).mean()
+            if loss_type == "softplus":
+                loss = (loss_temp * F.softplus((margin - target_sign * delta) / loss_temp)).mean()
+            else:
+                loss = torch.clamp(margin - target_sign * delta, min=0.0).mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
@@ -474,18 +481,33 @@ def run_multiband_training(args):
         num_workers=2 if use_cuda else 0
     )
     
+    # Freeze and preserve existing baseline checkpoint if present on disk
+    legacy_ckpt = Path("/kaggle/working/multiband_catcn_best.pt")
+    frozen_ckpt = Path("/kaggle/working/multiband_catcn_frozen_baseline.pt")
+    if legacy_ckpt.exists() and not frozen_ckpt.exists():
+        try:
+            import shutil
+            shutil.copyfile(legacy_ckpt, frozen_ckpt)
+            print(f"[FREEZE]: Saved and preserved baseline checkpoint to: {frozen_ckpt}")
+        except Exception as e:
+            print(f"[WARNING]: Could not freeze legacy checkpoint: {e}")
+
     # 4. Instantiate Multi-Band CA-TCN Model
     audio_in_channels = args.audio_bands + (1 if args.include_broadband else 0)
     model = MultiBandCATCNDecoder(
         eeg_channels=n_ch,
         audio_bands=audio_in_channels,
         hidden_dim=args.hidden_dim,
+        min_lag_samples=args.min_lag_samples,
         max_lag_samples=args.max_lag_samples,
-        dropout=args.dropout
+        dropout=args.dropout,
+        use_sinc=args.use_sinc
     ).to(device)
     
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\n[MODEL INITIALIZED]: MultiBand-CATCN with {n_params:,} trainable parameters.")
+    model_tag = "Sinc-CATCN-v2" if args.use_sinc else "MultiBand-CATCN-Baseline"
+    print(f"\n[MODEL INITIALIZED]: {model_tag} with {n_params:,} trainable parameters.")
+    print(f"  Loss: {args.loss} (margin={args.margin}, tau={args.loss_temp}) | Lags: [{args.min_lag_samples}, {args.max_lag_samples}]")
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
@@ -497,7 +519,7 @@ def run_multiband_training(args):
     
     # 5. Training Loop
     print("\n" + "=" * 96)
-    print(f"  COMMENCING MULTIBAND TRAINING ({args.epochs} EPOCHS)")
+    print(f"  COMMENCING {model_tag.upper()} TRAINING ({args.epochs} EPOCHS)")
     print("=" * 96)
     
     for epoch in range(1, args.epochs + 1):
@@ -530,8 +552,11 @@ def run_multiband_training(args):
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
                 delta, (l1, l2), _ = model(bx, c1, c2)
-                # Symmetrized Margin Ranking Loss: target_sign * delta > 0.5
-                loss = torch.clamp(0.5 - target_sign * delta, min=0.0).mean()
+                if args.loss == 'softplus':
+                    # Smooth logistic margin loss: eliminates hinge dead-zone while bounding gradients
+                    loss = (args.loss_temp * F.softplus((args.margin - target_sign * delta) / args.loss_temp)).mean()
+                else:
+                    loss = torch.clamp(args.margin - target_sign * delta, min=0.0).mean()
                 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -560,7 +585,10 @@ def run_multiband_training(args):
                 byb = byb.to(device, non_blocking=True)
                 with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
                     delta, (la, lb), _ = model(bx, bya, byb)
-                    v_loss = torch.clamp(0.5 - delta, min=0.0).mean()
+                    if args.loss == 'softplus':
+                        v_loss = (args.loss_temp * F.softplus((args.margin - delta) / args.loss_temp)).mean()
+                    else:
+                        v_loss = torch.clamp(args.margin - delta, min=0.0).mean()
                 val_loss += v_loss.item() * bx.size(0)
                 val_correct += int((delta > 0).sum().item())
                 n_val_samples += bx.size(0)
@@ -608,7 +636,8 @@ def run_multiband_training(args):
         if args.adapt and cal_eeg:
             eval_model = adapt_subject_spatial(
                 model, cal_eeg, cal_ya, cal_yb, win_5s_smp, int(args.hop_sec * FS), device,
-                epochs=args.calib_epochs, lr=args.calib_lr
+                epochs=args.calib_epochs, lr=args.calib_lr,
+                loss_type=args.loss, loss_temp=args.loss_temp, margin=args.margin
             )
             adapt_acc_5s, _ = evaluate_windows(eval_model, te_eeg, te_ya, te_yb, win_5s_smp, device)
         else:
@@ -648,10 +677,16 @@ def run_multiband_training(args):
     
     # Save Metrics JSON
     metrics = {
-        "architecture": "MultiBand-CATCN",
+        "architecture": "Sinc-MultiBand-CATCN-v2" if args.use_sinc else "MultiBand-CATCN-v1-Baseline",
+        "use_sinc": args.use_sinc,
+        "loss": args.loss,
+        "loss_temp": args.loss_temp,
+        "margin": args.margin,
         "montage": args.montage,
         "n_channels": n_ch,
-        "audio_bands": args.audio_bands,
+        "audio_bands": audio_in_channels,
+        "min_lag_samples": args.min_lag_samples,
+        "max_lag_samples": args.max_lag_samples,
         "epochs": args.epochs,
         "parameters": n_params,
         "best_val_acc": round(best_val_acc, 2),
@@ -680,7 +715,13 @@ if __name__ == "__main__":
     parser.add_argument("--test_split", type=float, default=0.2)
     parser.add_argument("--audio_bands", type=int, default=8)
     parser.add_argument("--hidden_dim", type=int, default=64)
-    parser.add_argument("--max_lag_samples", type=int, default=8)
+    parser.add_argument("--min_lag_samples", type=int, default=-2, help="Minimum lag samples (-2 = -31.25 ms)")
+    parser.add_argument("--max_lag_samples", type=int, default=18, help="Maximum lag samples (18 = +281.25 ms)")
+    parser.add_argument("--loss", type=str, default="softplus", choices=["softplus", "hinge"], help="Loss function (default: softplus to eliminate dead-zone)")
+    parser.add_argument("--loss_temp", type=float, default=0.5, help="Temperature for softplus logistic loss")
+    parser.add_argument("--margin", type=float, default=0.5, help="Separation margin between attended and unattended streams")
+    parser.add_argument("--use_sinc", action="store_true", default=True, help="Enable biological SincNet filterbank (Sinc-CATCN v2)")
+    parser.add_argument("--no_sinc", action="store_false", dest="use_sinc", help="Disable SincNet (revert to legacy baseline)")
     parser.add_argument("--dropout", type=float, default=0.35)
     parser.add_argument("--subband_mask_prob", type=float, default=0.25)
     parser.add_argument("--include_broadband", action="store_true", default=True, help="Include 1D broadband envelope as Channel 0 alongside 8 Gammatone subbands")
@@ -692,8 +733,8 @@ if __name__ == "__main__":
     parser.add_argument("--eeg_dir", type=str, default=None)
     parser.add_argument("--audio_dir", type=str, default=None)
     parser.add_argument("--audio_env_file", type=str, default=None)
-    parser.add_argument("--output_model", type=str, default="/kaggle/working/multiband_catcn_best.pt")
-    parser.add_argument("--output_metrics", type=str, default="/kaggle/working/multiband_catcn_metrics.json")
+    parser.add_argument("--output_model", type=str, default="/kaggle/working/sinc_multiband_catcn_best.pt")
+    parser.add_argument("--output_metrics", type=str, default="/kaggle/working/sinc_multiband_catcn_metrics.json")
     parser.add_argument("--smoke_test", action="store_true", help="Run rapid CPU smoke test")
     parser.add_argument("--subjects", type=str, default=None, help="Comma-separated subjects to run, or 'all'")
     args = parser.parse_args()
