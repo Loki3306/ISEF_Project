@@ -72,13 +72,13 @@ def butter_lowpass_sosfilt(data: np.ndarray, cutoff: float, fs: float, order: in
             out[b], _ = signal.sosfilt(sos, data[b], zi=zi)
         return out
 
-def evaluate_windows(model, eeg_list, ya_list, yb_list, label_list, window_samples, device):
-    """Evaluates non-overlapping windows across held-out test trials against ground truth labels."""
+def evaluate_windows(model, eeg_list, ya_list, yb_list, window_samples, device):
+    """Evaluates non-overlapping windows across held-out test trials against ground truth attended stream A."""
     total_wins = 0
     correct_wins = 0
     model.eval()
     with torch.no_grad():
-        for eeg, ya, yb, trial_label in zip(eeg_list, ya_list, yb_list, label_list):
+        for eeg, ya, yb in zip(eeg_list, ya_list, yb_list):
             t_len = min(len(eeg), ya.shape[-1], yb.shape[-1])
             for s in range(0, t_len - window_samples + 1, window_samples):
                 e = s + window_samples
@@ -86,9 +86,8 @@ def evaluate_windows(model, eeg_list, ya_list, yb_list, label_list, window_sampl
                 w_a = torch.from_numpy(ya[:, s:e].copy()).unsqueeze(0).float().to(device)
                 w_b = torch.from_numpy(yb[:, s:e].copy()).unsqueeze(0).float().to(device)
                 delta, (la, lb), _ = model(w_e, w_a, w_b)
-                # Model decision: Choose Stream A if delta > 0, Stream B if delta < 0
-                pred_label = 1 if delta.item() > 0 else 2
-                if pred_label == trial_label:
+                # In DTU, Stream A (ya) is ground-truth attended. Correct decision is delta > 0.
+                if delta.item() > 0.0:
                     correct_wins += 1
                 total_wins += 1
                 
@@ -251,8 +250,8 @@ def run_multiband_training(args):
     print("\n[DATA PREPARATION]: Extracting causal streaming EEG and multi-band envelopes...")
     t_data_start = time.time()
     
-    X_tr_list, S1_tr_list, S2_tr_list, TGT_tr_list = [], [], [], []
-    X_va_list, S1_va_list, S2_va_list, TGT_va_list = [], [], [], []
+    X_tr_list, YA_tr_list, YB_tr_list = [], [], []
+    X_va_list, YA_va_list, YB_va_list = [], [], []
     subject_test_data = {}
     total_train_trials = 0
     total_test_trials = 0
@@ -271,7 +270,7 @@ def run_multiband_training(args):
                     eeg=np.random.randn(3200, 64).astype(np.float32),
                     wav_a=np.random.randn(3200).astype(np.float32),
                     wav_b=np.random.randn(3200).astype(np.float32),
-                    label=(1 if i % 2 == 0 else 2)
+                    label=1
                 )
                 for i in range(n_trials)
             ]
@@ -302,10 +301,9 @@ def run_multiband_training(args):
             continue
             
         split_idx = int(math.floor(n_valid * (1.0 - args.test_split)))
-        sub_eeg_te, sub_ya_te, sub_yb_te, sub_lbl_te = [], [], [], []
+        sub_eeg_te, sub_ya_te, sub_yb_te = [], [], []
         
         for idx in range(n_valid):
-            trial_label = getattr(exs[idx], 'label', 1)  # 1 = Attend A, 2 = Attend B
             raw_eeg = exs[idx].eeg[:, montage_channels].astype(np.float32)
             cur_ya = raw_ya_list[idx]
             cur_yb = raw_yb_list[idx]
@@ -325,12 +323,7 @@ def run_multiband_training(args):
             ya_c = (ya_c - np.mean(ya_c, axis=-1, keepdims=True)) / (np.std(ya_c, axis=-1, keepdims=True) + 1e-12)
             yb_c = (yb_c - np.mean(yb_c, axis=-1, keepdims=True)) / (np.std(yb_c, axis=-1, keepdims=True) + 1e-12)
             
-            # Ground-truth attended vs unattended assignment:
-            if trial_label == 1:
-                cur_att, cur_unatt = ya_c, yb_c
-            else:
-                cur_att, cur_unatt = yb_c, ya_c
-            
+            # IN DTU: wavA (ya_c) is ALWAYS attended, wavB (yb_c) is ALWAYS unattended
             if idx < split_idx:
                 total_train_trials += 1
                 x_t = eeg_c.T # [C_eeg, T]
@@ -339,39 +332,29 @@ def run_multiband_training(args):
                 # Chunk training trials
                 hop_samples = int(args.hop_sec * FS)
                 start = 0
-                w_count = 0
                 while start + win_samples <= min_len:
                     end = start + win_samples
                     w_x = x_t[:, start:end]
-                    # Symmetrized training to eliminate slot position bias:
-                    # Alternate stream positions with ground-truth target:
-                    # Target = +1.0 when Slot 1 is attended, -1.0 when Slot 2 is attended
-                    if w_count % 2 == 0:
-                        w_s1, w_s2, tgt = cur_att[:, start:end], cur_unatt[:, start:end], 1.0
-                    else:
-                        w_s1, w_s2, tgt = cur_unatt[:, start:end], cur_att[:, start:end], -1.0
+                    w_ya = ya_c[:, start:end]
+                    w_yb = yb_c[:, start:end]
                     
                     if is_val_trial:
                         X_va_list.append(w_x)
-                        S1_va_list.append(w_s1)
-                        S2_va_list.append(w_s2)
-                        TGT_va_list.append(tgt)
+                        YA_va_list.append(w_ya)
+                        YB_va_list.append(w_yb)
                     else:
                         X_tr_list.append(w_x)
-                        S1_tr_list.append(w_s1)
-                        S2_tr_list.append(w_s2)
-                        TGT_tr_list.append(tgt)
+                        YA_tr_list.append(w_ya)
+                        YB_tr_list.append(w_yb)
                     start += hop_samples
-                    w_count += 1
             else:
                 total_test_trials += 1
                 sub_eeg_te.append(eeg_c)
                 sub_ya_te.append(ya_c)
                 sub_yb_te.append(yb_c)
-                sub_lbl_te.append(trial_label)
                 
         if sub_eeg_te:
-            subject_test_data[sub_name] = (sub_eeg_te, sub_ya_te, sub_yb_te, sub_lbl_te)
+            subject_test_data[sub_name] = (sub_eeg_te, sub_ya_te, sub_yb_te)
             
     print(f"[DATA READY]: Extracted {len(X_tr_list)} train windows, {len(X_va_list)} val windows across {total_train_trials} trials in {time.time()-t_data_start:.1f}s.")
     
@@ -379,32 +362,29 @@ def run_multiband_training(args):
         raise RuntimeError("No training windows extracted. Please check dataset paths and envelopes.")
         
     X_tr = torch.from_numpy(np.stack(X_tr_list, axis=0)).float()
-    S1_tr = torch.from_numpy(np.stack(S1_tr_list, axis=0)).float()
-    S2_tr = torch.from_numpy(np.stack(S2_tr_list, axis=0)).float()
-    TGT_tr = torch.from_numpy(np.array(TGT_tr_list, dtype=np.float32)).float()
+    YA_tr = torch.from_numpy(np.stack(YA_tr_list, axis=0)).float()
+    YB_tr = torch.from_numpy(np.stack(YB_tr_list, axis=0)).float()
     
     # Free memory
-    del X_tr_list, S1_tr_list, S2_tr_list, TGT_tr_list
+    del X_tr_list, YA_tr_list, YB_tr_list
     import gc
     gc.collect()
     
     if len(X_va_list) > 0:
         X_va = torch.from_numpy(np.stack(X_va_list, axis=0)).float()
-        S1_va = torch.from_numpy(np.stack(S1_va_list, axis=0)).float()
-        S2_va = torch.from_numpy(np.stack(S2_va_list, axis=0)).float()
-        TGT_va = torch.from_numpy(np.array(TGT_va_list, dtype=np.float32)).float()
-        del X_va_list, S1_va_list, S2_va_list, TGT_va_list
+        YA_va = torch.from_numpy(np.stack(YA_va_list, axis=0)).float()
+        YB_va = torch.from_numpy(np.stack(YB_va_list, axis=0)).float()
+        del X_va_list, YA_va_list, YB_va_list
         gc.collect()
     else:
         X_va = X_tr[:min(16, len(X_tr))]
-        S1_va = S1_tr[:min(16, len(S1_tr))]
-        S2_va = S2_tr[:min(16, len(S2_tr))]
-        TGT_va = TGT_tr[:min(16, len(TGT_tr))]
+        YA_va = YA_tr[:min(16, len(YA_tr))]
+        YB_va = YB_tr[:min(16, len(YB_tr))]
         
     # GPU OPTIMIZATION: Pinned memory for async DMA transfers
     use_cuda = torch.cuda.is_available()
     train_loader = DataLoader(
-        TensorDataset(X_tr, S1_tr, S2_tr, TGT_tr),
+        TensorDataset(X_tr, YA_tr, YB_tr),
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=(len(X_tr) > args.batch_size),
@@ -412,7 +392,7 @@ def run_multiband_training(args):
         num_workers=2 if use_cuda else 0
     )
     val_loader = DataLoader(
-        TensorDataset(X_va, S1_va, S2_va, TGT_va),
+        TensorDataset(X_va, YA_va, YB_va),
         batch_size=args.batch_size,
         shuffle=False,
         pin_memory=use_cuda,
@@ -424,8 +404,6 @@ def run_multiband_training(args):
         eeg_channels=n_ch,
         audio_bands=args.audio_bands,
         hidden_dim=args.hidden_dim,
-        num_heads=args.num_heads,
-        max_erp_samples=args.max_erp_samples,
         max_lag_samples=args.max_lag_samples,
         dropout=args.dropout
     ).to(device)
@@ -449,47 +427,61 @@ def run_multiband_training(args):
         t_epoch_start = time.time()
         model.train()
         train_loss = 0.0
+        train_correct = 0
+        n_train_samples = 0
         n_train_batches = 0
         
-        for bx, bs1, bs2, btgt in train_loader:
+        for bx, bya, byb in train_loader:
             bx = bx.to(device, non_blocking=True)
-            bs1 = bs1.to(device, non_blocking=True)
-            bs2 = bs2.to(device, non_blocking=True)
-            btgt = btgt.to(device, non_blocking=True)
+            bya = bya.to(device, non_blocking=True)
+            byb = byb.to(device, non_blocking=True)
             
-            optimizer.zero_grad()
+            # Symmetrized anti-biased candidate stream swapping
+            swap = torch.rand(bx.size(0), device=device) > 0.5
+            c1 = torch.where(swap[:, None, None], byb, bya)
+            c2 = torch.where(swap[:, None, None], bya, byb)
+            target_sign = torch.where(swap, -1.0, 1.0)
+            
+            optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
-                delta, (l1, l2), _ = model(bx, bs1, bs2)
-                # Symmetrized Margin Ranking Loss: btgt * delta > 0.5
-                loss = torch.clamp(0.5 - btgt * delta, min=0.0).mean()
+                delta, (l1, l2), _ = model(bx, c1, c2)
+                # Symmetrized Margin Ranking Loss: target_sign * delta > 0.5
+                loss = torch.clamp(0.5 - target_sign * delta, min=0.0).mean()
                 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             
-            train_loss += loss.item()
+            train_loss += loss.item() * bx.size(0)
+            train_correct += int(((target_sign * delta) > 0).sum().item())
+            n_train_samples += bx.size(0)
             n_train_batches += 1
             
         scheduler.step()
-        avg_train_loss = train_loss / max(1, n_train_batches)
+        avg_train_loss = train_loss / max(1, n_train_samples)
+        train_acc = (train_correct / max(1, n_train_samples)) * 100.0
         
         # Validation
         model.eval()
         val_loss = 0.0
-        n_val_batches = 0
+        val_correct = 0
+        n_val_samples = 0
         with torch.no_grad():
-            for bx, bs1, bs2, btgt in val_loader:
+            for bx, bya, byb in val_loader:
                 bx = bx.to(device, non_blocking=True)
-                bs1 = bs1.to(device, non_blocking=True)
-                bs2 = bs2.to(device, non_blocking=True)
-                btgt = btgt.to(device, non_blocking=True)
+                bya = bya.to(device, non_blocking=True)
+                byb = byb.to(device, non_blocking=True)
                 with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
-                    delta, (l1, l2), _ = model(bx, bs1, bs2)
-                    v_loss = torch.clamp(0.5 - btgt * delta, min=0.0).mean()
-                val_loss += v_loss.item()
-                n_val_batches += 1
+                    delta, (la, lb), _ = model(bx, bya, byb)
+                    v_loss = torch.clamp(0.5 - delta, min=0.0).mean()
+                val_loss += v_loss.item() * bx.size(0)
+                val_correct += int((delta > 0).sum().item())
+                n_val_samples += bx.size(0)
                 
-        avg_val_loss = val_loss / max(1, n_val_batches)
+        avg_val_loss = val_loss / max(1, n_val_samples)
+        val_acc = (val_correct / max(1, n_val_samples)) * 100.0
         epoch_sec = time.time() - t_epoch_start
         
         is_best = avg_val_loss < best_val_loss
@@ -500,7 +492,7 @@ def run_multiband_training(args):
         else:
             star_flag = ""
             
-        print(f"  Epoch [{epoch:02d}/{args.epochs:02d}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e} | Time: {epoch_sec:.1f}s{star_flag}")
+        print(f"  Epoch [{epoch:02d}/{args.epochs:02d}] | Train Loss: {avg_train_loss:.4f} (Acc: {train_acc:5.1f}%) | Val Loss: {avg_val_loss:.4f} (Acc: {val_acc:5.1f}%) | LR: {scheduler.get_last_lr()[0]:.2e} | Time: {epoch_sec:.1f}s{star_flag}")
         
         if epoch % 5 == 0 or is_best or epoch == args.epochs:
             ckpt_path = resolve_output_path(args.output_model)
@@ -518,8 +510,8 @@ def run_multiband_training(args):
     
     print(f"  {'Subject':<16} | {'2AFC Accuracy':<14} | {'Baseline (5s)':<14} | {'Gain / Margin':<14} | {'Test Wins':<10}")
     print("  " + "-" * 76)
-    for sub_name, (te_eeg, te_ya, te_yb, te_lbls) in subject_test_data.items():
-        acc, n_wins = evaluate_windows(model, te_eeg, te_ya, te_yb, te_lbls, win_samples, device)
+    for sub_name, (te_eeg, te_ya, te_yb) in subject_test_data.items():
+        acc, n_wins = evaluate_windows(model, te_eeg, te_ya, te_yb, win_samples, device)
         s_key = sub_name.split("_")[0].upper()
         base_acc = BASELINE_5S.get(s_key, 65.7)
         gain = acc - base_acc
