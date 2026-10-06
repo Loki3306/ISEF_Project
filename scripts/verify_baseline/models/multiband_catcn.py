@@ -582,10 +582,19 @@ except ImportError:
             FrozenMultiBandCATCNDecoder as MultiBandCATCNDecoder_Baseline
         )
 
+try:
+    from models.neuro_conformer import NeuroConformerDecoder
+except ImportError:
+    try:
+        from .neuro_conformer import NeuroConformerDecoder
+    except ImportError:
+        from neuro_conformer import NeuroConformerDecoder
+
 class MultiBandCATCNDecoder(nn.Module):
     """
     Unified MultiBand CA-TCN Decoder interface.
     Supports:
+    - arch='conformer' / 'neuroconformer': Dual-Stream Cross-Modal Neuro-Conformer (v4)
     - arch='msca': Multi-Scale Bilateral Sinc-Conformer (v3)
     - arch='sinc' / use_sinc=True: Sinc-CATCN (v2)
     - arch='baseline' / use_sinc=False: Legacy Baseline (v1)
@@ -606,7 +615,21 @@ class MultiBandCATCNDecoder(nn.Module):
         super().__init__()
         self.use_sinc = use_sinc
         self.arch = arch
-        if arch == "msca":
+        if arch in ["conformer", "neuroconformer"]:
+            d_m = hidden_dim if hidden_dim >= 64 else 80
+            self.model = NeuroConformerDecoder(
+                eeg_channels=eeg_channels,
+                audio_bands=audio_bands,
+                d_model=d_m,
+                conformer_blocks=2,
+                num_heads=4,
+                ffn_dim=d_m * 2,
+                min_lag=min_lag_samples,
+                max_lag=max_lag_samples,
+                dropout=dropout,
+                head_dropout=head_dropout
+            )
+        elif arch == "msca":
             self.model = MSCAMultiBandCATCNDecoder(
                 eeg_channels=eeg_channels,
                 audio_bands=audio_bands,

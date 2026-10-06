@@ -686,7 +686,14 @@ def run_multiband_training(args):
     ).to(device)
     
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    model_tag = "MSCA-CATCN-v3" if args.arch == "msca" else ("Sinc-CATCN-v2" if args.use_sinc else "MultiBand-CATCN-Baseline")
+    if args.arch in ["conformer", "neuroconformer"]:
+        model_tag = "NeuroConformer-v4"
+    elif args.arch == "msca":
+        model_tag = "MSCA-CATCN-v3"
+    elif args.use_sinc:
+        model_tag = "Sinc-CATCN-v2"
+    else:
+        model_tag = "MultiBand-CATCN-Baseline"
     print(f"\n[MODEL INITIALIZED]: {model_tag} with {n_params:,} trainable parameters.")
     print(f"  Head: {args.head_type} (dropout={args.head_dropout}) | Loss: {args.loss} (margin={args.margin}, tau={args.loss_temp}) | Lags: [{args.min_lag_samples}, {args.max_lag_samples}]")
     
@@ -835,7 +842,7 @@ def run_multiband_training(args):
     # 6. Final Evaluation on Held-Out Test Split (Multi-Tier Combined Benchmark)
     print("\n" + "=" * 128)
     print("  GRAND COHORT BENCHMARK ON HELD-OUT TEST TRIALS (UNIFIED BEST METHODS COMBINED)")
-    print("  Backbone: Sinc-CATCN-v2 | Spatial: 64-Param Identity-Regularized Adapter | Gate: Sticky Hysteresis Gate")
+    print(f"  Backbone: {model_tag} | Spatial: 64-Param Identity-Regularized Adapter | Gate: Sticky Hysteresis Gate")
     print("=" * 128)
     model.load_state_dict(best_weights)
     model.eval()
@@ -1071,7 +1078,7 @@ if __name__ == "__main__":
     parser.add_argument("--eeg_dir", type=str, default=None)
     parser.add_argument("--audio_dir", type=str, default=None)
     parser.add_argument("--audio_env_file", type=str, default=None)
-    parser.add_argument("--arch", type=str, default="sinc", choices=["sinc", "msca", "baseline"], help="Model architecture: 'sinc' (v2), 'msca' (v3 multi-scale bilateral conformer), 'baseline' (v1)")
+    parser.add_argument("--arch", type=str, default="sinc", choices=["conformer", "neuroconformer", "msca", "sinc", "baseline"], help="Model architecture: 'conformer' (v4 Dual-Stream Cross-Modal Neuro-Conformer), 'msca' (v3), 'sinc' (v2), 'baseline' (v1)")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Pre-trained checkpoint to load")
     parser.add_argument("--eval_only", action="store_true", help="Skip backbone training and execute adaptation and multi-tier benchmark directly")
     parser.add_argument("--streaming_context", action="store_true", help="Enable continuous streaming context for multi-scale 10s and 20s windows")

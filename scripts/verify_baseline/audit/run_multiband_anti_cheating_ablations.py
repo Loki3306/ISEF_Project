@@ -68,6 +68,9 @@ def run_multiband_ablations(args):
     # 1. Locate and Load Pre-Trained Checkpoint
     checkpoint_candidates = [
         Path(args.checkpoint_path) if args.checkpoint_path else None,
+        Path("/kaggle/working/neuro_conformer_best.pt"),
+        Path("/kaggle/working/msca_catcn_v3_best.pt"),
+        REPO_ROOT / "results" / "multiband_catcn" / "neuro_conformer_best.pt",
         REPO_ROOT / "results" / "multiband_catcn" / "sinc_multiband_catcn_best.pt",
         Path("/kaggle/working/sinc_multiband_catcn_best.pt"),
         Path("sinc_multiband_catcn_best.pt"),
@@ -399,7 +402,7 @@ if __name__ == "__main__":
     parser.add_argument("--min_lag_samples", type=int, default=-2)
     parser.add_argument("--max_lag_samples", type=int, default=18)
     parser.add_argument("--head_type", type=str, default="linear")
-    parser.add_argument("--arch", type=str, default="sinc", choices=["sinc", "msca", "baseline"])
+    parser.add_argument("--arch", type=str, default="sinc", choices=["conformer", "neuroconformer", "msca", "sinc", "baseline"])
     parser.add_argument("--use_sinc", action="store_true", default=True)
     parser.add_argument("--include_broadband", action="store_true", default=True)
     parser.add_argument("--calib_trials", type=int, default=12)
