@@ -313,10 +313,12 @@ def run_multiband_training(args):
             raise e
 
     win_samples = int(args.window_sec * FS)
-    causal_eeg_filter = StreamingCausalEEGFilter(lowcut=1.0, highcut=6.0, fs=FS, order=2, n_channels=n_ch)
+    causal_eeg_filter = StreamingCausalEEGFilter(
+        lowcut=args.eeg_lowcut, highcut=args.eeg_highcut, fs=FS, order=2, n_channels=n_ch
+    )
     
     # 3. Process Subjects into Training/Validation Tensors
-    print("\n[DATA PREPARATION]: Extracting causal streaming EEG and multi-band envelopes...")
+    print(f"\n[DATA PREPARATION]: Extracting causal streaming EEG ({args.eeg_lowcut}-{args.eeg_highcut} Hz) and multi-band envelopes (<{args.audio_lowpass} Hz)...")
     t_data_start = time.time()
     
     X_tr_list, YA_tr_list, YB_tr_list = [], [], []
@@ -388,8 +390,8 @@ def run_multiband_training(args):
             eeg_c = (eeg_c - np.mean(eeg_c, axis=0, keepdims=True)) / (np.std(eeg_c, axis=0, keepdims=True) + 1e-12)
             
             # Causal Audio lowpass + standardization
-            ya_c = butter_lowpass_sosfilt(cur_ya, 8.0, FS, order=2).astype(np.float32)
-            yb_c = butter_lowpass_sosfilt(cur_yb, 8.0, FS, order=2).astype(np.float32)
+            ya_c = butter_lowpass_sosfilt(cur_ya, args.audio_lowpass, FS, order=2).astype(np.float32)
+            yb_c = butter_lowpass_sosfilt(cur_yb, args.audio_lowpass, FS, order=2).astype(np.float32)
             ya_c = (ya_c - np.mean(ya_c, axis=-1, keepdims=True)) / (np.std(ya_c, axis=-1, keepdims=True) + 1e-12)
             yb_c = (yb_c - np.mean(yb_c, axis=-1, keepdims=True)) / (np.std(yb_c, axis=-1, keepdims=True) + 1e-12)
             
@@ -500,6 +502,7 @@ def run_multiband_training(args):
         hidden_dim=args.hidden_dim,
         min_lag_samples=args.min_lag_samples,
         max_lag_samples=args.max_lag_samples,
+        head_type=args.head_type,
         dropout=args.dropout,
         use_sinc=args.use_sinc
     ).to(device)
@@ -507,7 +510,7 @@ def run_multiband_training(args):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model_tag = "Sinc-CATCN-v2" if args.use_sinc else "MultiBand-CATCN-Baseline"
     print(f"\n[MODEL INITIALIZED]: {model_tag} with {n_params:,} trainable parameters.")
-    print(f"  Loss: {args.loss} (margin={args.margin}, tau={args.loss_temp}) | Lags: [{args.min_lag_samples}, {args.max_lag_samples}]")
+    print(f"  Head: {args.head_type} | Loss: {args.loss} (margin={args.margin}, tau={args.loss_temp}) | Lags: [{args.min_lag_samples}, {args.max_lag_samples}]")
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
@@ -542,6 +545,12 @@ def run_multiband_training(args):
                 byb = byb.clone()
                 bya[:, mb, :] = 0.0
                 byb[:, mb, :] = 0.0
+
+            # Spatial Electrode SpecAugment (mask 1 random channel with p=args.channel_mask_prob to prevent hemisphere bias)
+            if args.channel_mask_prob > 0 and np.random.rand() < args.channel_mask_prob:
+                mc = np.random.randint(0, bx.size(1))
+                bx = bx.clone()
+                bx[:, mc, :] = 0.0
             
             # Symmetrized anti-biased candidate stream swapping
             swap = torch.rand(bx.size(0), device=device) > 0.5
@@ -717,6 +726,10 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--min_lag_samples", type=int, default=-2, help="Minimum lag samples (-2 = -31.25 ms)")
     parser.add_argument("--max_lag_samples", type=int, default=18, help="Maximum lag samples (18 = +281.25 ms)")
+    parser.add_argument("--head_type", type=str, default="factored", choices=["factored", "linear"], help="Cross-correlation classification head type ('factored' low-rank vs 'linear' unconstrained)")
+    parser.add_argument("--eeg_lowcut", type=float, default=0.5, help="EEG bandpass low cutoff in Hz (default: 0.5)")
+    parser.add_argument("--eeg_highcut", type=float, default=30.0, help="EEG bandpass high cutoff in Hz (default: 30.0, unblocks Theta/Alpha/Beta bands)")
+    parser.add_argument("--audio_lowpass", type=float, default=28.0, help="Audio envelope lowpass cutoff in Hz (default: 28.0)")
     parser.add_argument("--loss", type=str, default="softplus", choices=["softplus", "hinge"], help="Loss function (default: softplus to eliminate dead-zone)")
     parser.add_argument("--loss_temp", type=float, default=0.5, help="Temperature for softplus logistic loss")
     parser.add_argument("--margin", type=float, default=0.5, help="Separation margin between attended and unattended streams")
@@ -724,12 +737,13 @@ if __name__ == "__main__":
     parser.add_argument("--no_sinc", action="store_false", dest="use_sinc", help="Disable SincNet (revert to legacy baseline)")
     parser.add_argument("--dropout", type=float, default=0.35)
     parser.add_argument("--subband_mask_prob", type=float, default=0.25)
+    parser.add_argument("--channel_mask_prob", type=float, default=0.20, help="Probability of masking 1 random EEG channel during training (Spatial SpecAugment)")
     parser.add_argument("--include_broadband", action="store_true", default=True, help="Include 1D broadband envelope as Channel 0 alongside 8 Gammatone subbands")
     parser.add_argument("--no_broadband", action="store_false", dest="include_broadband", help="Disable broadband envelope inclusion")
     parser.add_argument("--adapt", action="store_true", default=True, help="Enable few-shot spatial adaptation")
     parser.add_argument("--no_adapt", action="store_false", dest="adapt", help="Disable few-shot spatial adaptation")
-    parser.add_argument("--calib_epochs", type=int, default=10, help="Few-shot spatial calibration epochs")
-    parser.add_argument("--calib_lr", type=float, default=2e-4, help="Learning rate for spatial calibration")
+    parser.add_argument("--calib_epochs", type=int, default=3, help="Few-shot spatial calibration epochs")
+    parser.add_argument("--calib_lr", type=float, default=5e-5, help="Learning rate for spatial calibration")
     parser.add_argument("--eeg_dir", type=str, default=None)
     parser.add_argument("--audio_dir", type=str, default=None)
     parser.add_argument("--audio_env_file", type=str, default=None)

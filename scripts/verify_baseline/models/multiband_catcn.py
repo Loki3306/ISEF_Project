@@ -225,21 +225,33 @@ class SincCATCN_AudioEncoder(nn.Module):
 class BilinearCrossCorrelationHead(nn.Module):
     """
     Normalized Multi-Lag Cross-Correlation Head with Guaranteed Anti-Symmetry.
-    Computes normalized cross-correlations across temporal lags tau in [min_lag, max_lag],
-    then passes the concatenated correlation coefficients to a linear classifier without bias.
+    Supports:
+    1. 'factored' (Default): Low-rank channel (D=64) + physiological ERP latency kernel (K=21) + learnable scale.
+       Total: 86 parameters. Prevents 5.0s window memorization and generalization gaps.
+    2. 'linear': Fully unconstrained linear mapping across D * K lags (1,344 parameters).
     
     Guarantees:
     1. Zero Data Leakage: Purely bilinear dot-product between temporally standardized EEG and Audio.
     2. Strict Anti-Symmetry: Delta(A, B) = -Delta(B, A).
     3. Physiological ERP Focus: Focuses on physiological causal delays (N100, P200).
     """
-    def __init__(self, hidden_dim: int = 64, min_lag: int = -2, max_lag: int = 18):
+    def __init__(self, hidden_dim: int = 64, min_lag: int = -2, max_lag: int = 18, head_type: str = "factored"):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.min_lag = min_lag
         self.max_lag = max_lag
         self.num_lags = max_lag - min_lag + 1
-        self.classifier = nn.Linear(hidden_dim * self.num_lags, 1, bias=False)
+        self.head_type = head_type
+        
+        if head_type == "factored":
+            self.channel_weight = nn.Parameter(torch.ones(hidden_dim) / math.sqrt(hidden_dim))
+            # Gaussian ERP latency prior centered at lag 8 (~125 ms / N100-P200 peak)
+            lags = torch.arange(min_lag, max_lag + 1).float()
+            prior = torch.exp(-0.5 * ((lags - 8.0) / 4.0) ** 2)
+            self.lag_weight = nn.Parameter(prior / prior.sum())
+            self.scale = nn.Parameter(torch.tensor(5.0))
+        else:
+            self.classifier = nn.Linear(hidden_dim * self.num_lags, 1, bias=False)
         
     def compute_cross_correlation(self, z_eeg: torch.Tensor, z_audio: torch.Tensor) -> torch.Tensor:
         B, D, T = z_eeg.shape
@@ -268,15 +280,18 @@ class BilinearCrossCorrelationHead(nn.Module):
             r_tau = (ze_slice * za_slice).mean(dim=-1) # [B, D]
             corrs.append(r_tau)
             
-        r_all = torch.stack(corrs, dim=-1).view(B, -1) # [B, D * num_lags]
-        return r_all
+        if self.head_type == "factored":
+            R = torch.stack(corrs, dim=1) # [B, num_lags, D]
+            weighted_ch = (R * self.channel_weight.view(1, 1, D)).sum(dim=-1) # [B, num_lags]
+            score = (weighted_ch * self.lag_weight.view(1, -1)).sum(dim=-1) # [B]
+            return self.scale * score
+        else:
+            r_all = torch.stack(corrs, dim=-1).view(B, -1) # [B, D * num_lags]
+            return self.classifier(r_all).squeeze(-1)
         
     def forward(self, z_eeg: torch.Tensor, z_a: torch.Tensor, z_b: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        r_a = self.compute_cross_correlation(z_eeg, z_a)
-        r_b = self.compute_cross_correlation(z_eeg, z_b)
-        
-        logit_a = self.classifier(r_a).squeeze(-1) # [B]
-        logit_b = self.classifier(r_b).squeeze(-1) # [B]
+        logit_a = self.compute_cross_correlation(z_eeg, z_a)
+        logit_b = self.compute_cross_correlation(z_eeg, z_b)
         
         delta = logit_a - logit_b
         return delta, (logit_a, logit_b)
@@ -295,6 +310,7 @@ class SincMultiBandCATCNDecoder(nn.Module):
         sinc_bands: int = 8,
         min_lag: int = -2,
         max_lag: int = 18,
+        head_type: str = "factored",
         dropout: float = 0.2
     ):
         super().__init__()
@@ -318,7 +334,8 @@ class SincMultiBandCATCNDecoder(nn.Module):
         self.classifier_head = BilinearCrossCorrelationHead(
             hidden_dim=hidden_dim,
             min_lag=min_lag,
-            max_lag=max_lag
+            max_lag=max_lag,
+            head_type=head_type
         )
         
     def forward(
@@ -371,6 +388,7 @@ class MultiBandCATCNDecoder(nn.Module):
         hidden_dim: int = 64,
         max_lag_samples: int = 8,
         min_lag_samples: int = -2,
+        head_type: str = "factored",
         dropout: float = 0.2,
         use_sinc: bool = True
     ):
@@ -383,6 +401,7 @@ class MultiBandCATCNDecoder(nn.Module):
                 hidden_dim=hidden_dim,
                 min_lag=min_lag_samples,
                 max_lag=max_lag_samples,
+                head_type=head_type,
                 dropout=dropout
             )
         else:
