@@ -33,6 +33,9 @@ if str(VERIFY_ROOT) not in sys.path:
 
 from models.multiband_catcn import MultiBandCATCNDecoder
 from src.streaming.causal_filters import StreamingCausalEEGFilter
+from src.models.spatial_adapter import SpatialEEGAdapter
+from src.selective_aad.temporal_gate import SignalQualityMonitor, StickyHysteresisGate
+from src.selective_aad.metrics import calculate_selective_metrics, compute_temporal_stability_metrics
 from baselines.ridge_aad import load_subject_examples, TrialExample
 from training.montages import MONTAGES, DTU_CHANNELS
 from data.multiband_provider import get_multiband_envelopes, get_mapping
@@ -73,23 +76,27 @@ def butter_lowpass_sosfilt(data: np.ndarray, cutoff: float, fs: float, order: in
             out[b], _ = signal.sosfilt(sos, data[b], zi=zi)
         return out
 
-def evaluate_windows(model, eeg_list, ya_list, yb_list, window_samples, device, streaming_context=False):
+def evaluate_windows(model, eeg_list, ya_list, yb_list, window_samples, device, adapter=None, streaming_context=False):
     """
     Evaluates non-overlapping windows across held-out test trials against ground truth attended stream A.
     - streaming_context=False: Isolated windows (cold-start zero-padded transients).
     - streaming_context=True: Continuous streaming (receptive fields maintain continuous buffer context).
+    - adapter: Optional SpatialEEGAdapter for subject-specific skull impedance realignment.
     """
     total_wins = 0
     correct_wins = 0
     model.eval()
+    if adapter is not None:
+        adapter.eval()
     with torch.no_grad():
         for eeg, ya, yb in zip(eeg_list, ya_list, yb_list):
             t_len = min(len(eeg), ya.shape[-1], yb.shape[-1])
             if streaming_context:
-                # Real-time continuous ring-buffer evaluation (no zero-padding cold-start transients)
                 full_e = torch.from_numpy(eeg[:t_len].T.copy()).unsqueeze(0).float().to(device)
                 full_a = torch.from_numpy(ya[:, :t_len].copy()).unsqueeze(0).float().to(device)
                 full_b = torch.from_numpy(yb[:, :t_len].copy()).unsqueeze(0).float().to(device)
+                if adapter is not None:
+                    full_e = adapter(full_e)
                 z_eeg = model.eeg_encoder(full_e)
                 z_a = model.audio_encoder(full_a)
                 z_b = model.audio_encoder(full_b)
@@ -105,6 +112,8 @@ def evaluate_windows(model, eeg_list, ya_list, yb_list, window_samples, device, 
                     w_e = torch.from_numpy(eeg[s:e].T.copy()).unsqueeze(0).float().to(device)
                     w_a = torch.from_numpy(ya[:, s:e].copy()).unsqueeze(0).float().to(device)
                     w_b = torch.from_numpy(yb[:, s:e].copy()).unsqueeze(0).float().to(device)
+                    if adapter is not None:
+                        w_e = adapter(w_e)
                     delta, (la, lb), _ = model(w_e, w_a, w_b)
                     if delta.item() > 0.0:
                         correct_wins += 1
@@ -115,94 +124,183 @@ def evaluate_windows(model, eeg_list, ya_list, yb_list, window_samples, device, 
     acc = (correct_wins / total_wins) * 100.0
     return acc, total_wins
 
-def adapt_subject_spatial(
-    base_model, calib_eeg, calib_ya, calib_yb, win_samples, hop_samples, device,
-    epochs=10, lr=2e-4, loss_type="softplus", loss_temp=0.5, margin=0.5
-):
+def train_subject_spatial_adapter(
+    base_model: nn.Module,
+    calib_eeg: list[np.ndarray],
+    calib_ya: list[np.ndarray],
+    calib_yb: list[np.ndarray],
+    win_samples: int,
+    hop_samples: int,
+    device: torch.device,
+    epochs: int = 15,
+    lr: float = 1e-3,
+    l2_identity: float = 0.05,
+    n_channels: int = 8,
+) -> SpatialEEGAdapter:
     """
-    Fine-tunes the spatial projection + spatial BatchNorm parameters on calibration trials (trials 00-02)
-    to match the subject's physical skull impedance, individual frequency resonance, and electrode dipole orientation.
-    All multi-band temporal TCN blocks, biological Sinc filters, and cross-correlation classifier parameters remain strictly frozen.
+    Trains the dedicated 64-parameter SpatialEEGAdapter (W in R^{8x8}) on calibration trials
+    while keeping the entire Sinc-CATCN backbone 100% frozen.
+    Features:
+    - Frobenius identity regularization: ||W - I_8||_F^2 (shrinkage towards unadapted baseline).
+    - Symmetric dual-target augmentation: (x, ya, yb) -> 1.0, (x, yb, ya) -> 0.0.
+    - Safe-revert fallback: if adapted calibration accuracy drops below identity, resets to identity.
     """
-    model = deepcopy(base_model)
-    for p in model.parameters():
-        p.requires_grad = False
-    for p in model.eeg_encoder.spatial_proj.parameters():
-        p.requires_grad = True
-    for p in model.eeg_encoder.bn_spatial.parameters():
-        p.requires_grad = True
+    adapter = SpatialEEGAdapter(channels=n_channels).to(device)
+    if not calib_eeg:
+        return adapter
         
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
-    
-    X_cal, YA_cal, YB_cal = [], [], []
+    x_list, ya_list, yb_list = [], [], []
     for eeg, ya, yb in zip(calib_eeg, calib_ya, calib_yb):
         min_len = min(len(eeg), ya.shape[-1], yb.shape[-1])
-        x_t = eeg[:min_len].T if eeg.shape[0] >= eeg.shape[1] else eeg.T[:min_len]
-        start = 0
-        while start + win_samples <= min_len:
-            end = start + win_samples
-            X_cal.append(x_t[:, start:end])
-            YA_cal.append(ya[:, start:end])
-            YB_cal.append(yb[:, start:end])
-            start += hop_samples
+        s = 0
+        while s + win_samples <= min_len:
+            e = s + win_samples
+            w_e = eeg[s:e]
+            w_ya = ya[:, s:e]
+            w_yb = yb[:, s:e]
             
-    if not X_cal:
-        return model
+            w_e_std = (w_e - np.mean(w_e, axis=0, keepdims=True)) / (np.std(w_e, axis=0, keepdims=True) + 1e-8)
+            w_ya_std = (w_ya - np.mean(w_ya, axis=-1, keepdims=True)) / (np.std(w_ya, axis=-1, keepdims=True) + 1e-8)
+            w_yb_std = (w_yb - np.mean(w_yb, axis=-1, keepdims=True)) / (np.std(w_yb, axis=-1, keepdims=True) + 1e-8)
+            
+            x_list.append(w_e_std.T)
+            ya_list.append(w_ya_std)
+            yb_list.append(w_yb_std)
+            s += hop_samples
+            
+    if not x_list:
+        return adapter
         
+    x_arr = np.stack(x_list, axis=0)
+    ya_arr = np.stack(ya_list, axis=0)
+    yb_arr = np.stack(yb_list, axis=0)
+    N = len(x_arr)
+    
+    # Symmetrized dual-target dataset
+    x_aug = np.concatenate([x_arr, x_arr], axis=0)
+    c1_aug = np.concatenate([ya_arr, yb_arr], axis=0)
+    c2_aug = np.concatenate([yb_arr, ya_arr], axis=0)
+    labels_aug = np.concatenate([np.ones(N, dtype=np.float32), np.zeros(N, dtype=np.float32)], axis=0)
+    
     ds = TensorDataset(
-        torch.from_numpy(np.stack(X_cal, axis=0)).float(),
-        torch.from_numpy(np.stack(YA_cal, axis=0)).float(),
-        torch.from_numpy(np.stack(YB_cal, axis=0)).float()
+        torch.from_numpy(x_aug).float(),
+        torch.from_numpy(c1_aug).float(),
+        torch.from_numpy(c2_aug).float(),
+        torch.from_numpy(labels_aug).float()
     )
     loader = DataLoader(ds, batch_size=min(32, len(ds)), shuffle=True)
     
-    # Strictly preserve frozen BatchNorm statistics in TCN and audio encoders
-    model.eval()
-    model.eeg_encoder.spatial_proj.train()
-    model.eeg_encoder.bn_spatial.train()
-    
-    # Measure baseline calibration accuracy
+    # Ensure backbone is strictly frozen
     base_model.eval()
+    for p in base_model.parameters():
+        p.requires_grad = False
+        
+    adapter.train()
+    optimizer = optim.AdamW(adapter.parameters(), lr=lr, weight_decay=1e-4)
+    
+    # Measure baseline accuracy on calibration set with identity adapter
     with torch.no_grad():
+        adapter.eval()
         init_correct = 0
         total_cal = 0
-        for bx, bya, byb in loader:
-            bx, bya, byb = bx.to(device), bya.to(device), byb.to(device)
-            d, _, _ = base_model(bx, bya, byb)
-            init_correct += int((d > 0).sum().item())
+        for bx, bya, byb, blab in loader:
+            bx, bya, byb, blab = bx.to(device), bya.to(device), byb.to(device), blab.to(device)
+            d, _, _ = base_model(adapter(bx), bya, byb)
+            init_correct += int(((d > 0.0) == (blab > 0.5)).sum().item())
             total_cal += bx.size(0)
             
+    adapter.train()
     for _ in range(epochs):
-        for bx, bya, byb in loader:
-            bx, bya, byb = bx.to(device), bya.to(device), byb.to(device)
-            swap = torch.rand(bx.size(0), device=device) > 0.5
-            c1 = torch.where(swap[:, None, None], byb, bya)
-            c2 = torch.where(swap[:, None, None], bya, byb)
-            target_sign = torch.where(swap, -1.0, 1.0)
-            
+        for bx, bya, byb, blab in loader:
+            bx, bya, byb, blab = bx.to(device), bya.to(device), byb.to(device), blab.to(device)
             optimizer.zero_grad(set_to_none=True)
-            delta, (l1, l2), _ = model(bx, c1, c2)
-            if loss_type == "softplus":
-                loss = (loss_temp * F.softplus((margin - target_sign * delta) / loss_temp)).mean()
-            else:
-                loss = torch.clamp(margin - target_sign * delta, min=0.0).mean()
+            bx_adapted = adapter(bx)
+            delta, _, _ = base_model(bx_adapted, bya, byb)
+            loss_task = F.binary_cross_entropy_with_logits(delta, blab)
+            loss_reg = l2_identity * adapter.identity_regularization_loss()
+            loss = loss_task + loss_reg
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
             
-    model.eval()
+    adapter.eval()
     with torch.no_grad():
-        final_correct = 0
-        for bx, bya, byb in loader:
-            bx, bya, byb = bx.to(device), bya.to(device), byb.to(device)
-            d, _, _ = model(bx, bya, byb)
-            final_correct += int((d > 0).sum().item())
+        post_correct = 0
+        for bx, bya, byb, blab in loader:
+            bx, bya, byb, blab = bx.to(device), bya.to(device), byb.to(device), blab.to(device)
+            d, _, _ = base_model(adapter(bx), bya, byb)
+            post_correct += int(((d > 0.0) == (blab > 0.5)).sum().item())
             
-    # Guarantee safe adaptation: preserve base model if adaptation degraded
-    if final_correct < init_correct:
-        return base_model
-    return model
+    # Guarantee safe adaptation: revert to identity if calibration accuracy degraded
+    if post_correct < init_correct:
+        adapter.reset_to_identity()
+        
+    return adapter
+
+def evaluate_streaming_trials(
+    model: nn.Module,
+    adapter: SpatialEEGAdapter | None,
+    eeg_list: list[np.ndarray],
+    ya_list: list[np.ndarray],
+    yb_list: list[np.ndarray],
+    window_sec: float = 5.0,
+    step_sec: float = 0.5,
+    fs: float = 64.0,
+    device: torch.device = torch.device("cpu")
+):
+    """
+    Extracts rolling window neural correlation margins on sequential test trials.
+    Supports adapter=None (Zero-Shot) and adapter=SpatialEEGAdapter (Adapted).
+    Returns (trials_margins, trials_labels, trials_raw_eeg).
+    """
+    model.eval()
+    if adapter is not None:
+        adapter.eval()
+        
+    window_samples = int(window_sec * fs)
+    step_samples = int(step_sec * fs)
+    
+    trials_margins = []
+    trials_labels = []
+    trials_raw_eeg = []
+    
+    with torch.no_grad():
+        for eeg, ya, yb in zip(eeg_list, ya_list, yb_list):
+            t_len = min(len(eeg), ya.shape[-1], yb.shape[-1])
+            win_e, win_a, win_b = [], [], []
+            raw_e = []
+            
+            curr_start = 0
+            while curr_start + window_samples <= t_len:
+                curr_end = curr_start + window_samples
+                w_e = eeg[curr_start:curr_end]
+                w_a = ya[:, curr_start:curr_end]
+                w_b = yb[:, curr_start:curr_end]
+                
+                raw_e.append(w_e)
+                w_e_std = (w_e - np.mean(w_e, axis=0, keepdims=True)) / (np.std(w_e, axis=0, keepdims=True) + 1e-8)
+                w_a_std = (w_a - np.mean(w_a, axis=-1, keepdims=True)) / (np.std(w_a, axis=-1, keepdims=True) + 1e-8)
+                w_b_std = (w_b - np.mean(w_b, axis=-1, keepdims=True)) / (np.std(w_b, axis=-1, keepdims=True) + 1e-8)
+                
+                win_e.append(w_e_std.T)
+                win_a.append(w_a_std)
+                win_b.append(w_b_std)
+                curr_start += step_samples
+                
+            if win_e:
+                t_e = torch.from_numpy(np.stack(win_e)).float().to(device)
+                t_a = torch.from_numpy(np.stack(win_a)).float().to(device)
+                t_b = torch.from_numpy(np.stack(win_b)).float().to(device)
+                
+                if adapter is not None:
+                    t_e = adapter(t_e)
+                    
+                d, _, _ = model(t_e, t_a, t_b)
+                m_vals = d.detach().cpu().numpy().tolist()
+                trials_margins.append(np.array(m_vals, dtype=np.float64))
+                trials_labels.append(np.ones(len(m_vals), dtype=np.int64))
+                trials_raw_eeg.append(raw_e)
+                
+    return trials_margins, trials_labels, trials_raw_eeg
 
 def discover_eeg_subjects(custom_eeg_dir: str = None) -> list[Path]:
     """Discovers all DTU S*_data_preproc.mat files with exhaustive error-tolerant search."""
@@ -296,6 +394,7 @@ def run_multiband_training(args):
     if args.smoke_test:
         args.epochs = 1
         args.batch_size = min(args.batch_size, 16)
+        args.calib_epochs = min(args.calib_epochs, 2)
         print("\n" + "=" * 96)
         print("  [SMOKE TEST MODE ENABLED]: Running rapid 1-epoch pipeline verification on CPU")
         print("=" * 96)
@@ -446,8 +545,8 @@ def run_multiband_training(args):
                 x_t = eeg_c.T # [C_eeg, T]
                 is_val_trial = (idx % 10 == 0)
                 
-                # First 3 trials preserved as calibration set for few-shot spatial adaptation
-                if idx < 3:
+                # Calibration trials preserved for few-shot spatial adaptation (within train split)
+                if idx < args.calib_trials:
                     sub_eeg_cal.append(eeg_c)
                     sub_ya_cal.append(ya_c)
                     sub_yb_cal.append(yb_c)
@@ -671,75 +770,166 @@ def run_multiband_training(args):
             ckpt_path = resolve_output_path(args.output_model)
             torch.save(best_weights, ckpt_path)
             
-    # 6. Final Evaluation on Held-Out Test Split
-    print("\n" + "=" * 108)
-    print("  GRAND COHORT EVALUATION ON HELD-OUT TRIALS (MULTI-SCALE 5.0s, 10.0s, 20.0s)")
-    print("=" * 108)
+    # 6. Final Evaluation on Held-Out Test Split (Multi-Tier Combined Benchmark)
+    print("\n" + "=" * 128)
+    print("  GRAND COHORT BENCHMARK ON HELD-OUT TEST TRIALS (UNIFIED BEST METHODS COMBINED)")
+    print("  Backbone: Sinc-CATCN-v2 | Spatial: 64-Param Identity-Regularized Adapter | Gate: Sticky Hysteresis Gate")
+    print("=" * 128)
     model.load_state_dict(best_weights)
     model.eval()
     
     subject_results = {}
-    cohort_accs_5s = []
-    cohort_accs_10s = []
-    cohort_accs_20s = []
+    cohort_t1_acc = []
+    cohort_t1_fsw = []
+    cohort_t2_acc = []
+    cohort_t2_fsw = []
+    cohort_t2_gain = []
+    cohort_t3_acc = []
+    cohort_t3_cov = []
+    cohort_t3_fsw = []
+    cohort_10s = []
+    cohort_20s = []
     
-    win_5s_smp = int(5.0 * FS)
+    win_5s_smp = int(args.window_sec * FS)
     win_10s_smp = int(10.0 * FS)
     win_20s_smp = int(20.0 * FS)
+    sq_monitor = SignalQualityMonitor()
     
-    print(f"  {'Subject':<16} | {'Zero-Shot(5s)':<14} | {'Adapted(5s)':<12} | {'Streaming(5s)':<14} | {'10.0s Acc':<10} | {'20.0s Acc':<10} | {'Baseline(5s)':<13} | {'Gain(5s)':<10}")
-    print("  " + "-" * 116)
-    cohort_accs_stream_5s = []
+    print(f"  {'Subject':<8} | {'1. Raw Zero-Shot(5s)':<18} | {'2. Raw 8x8 Adapted(5s)':<22} | {'3. Adapt+Sticky Gate(5s)':<24} | {'10.0s':<7} | {'20.0s':<7} | {'Base(5s)':<8}")
+    print(f"  {'':<8} | {'Acc':<7} {'FalseSw':<9} | {'Acc':<7} {'dRaw':<6} {'FalseSw':<7} | {'Acc':<7} {'Boost%':<7} {'FalseSw':<8} | {'Acc':<7} | {'Acc':<7} | {'Canon':<8}")
+    print("  " + "-" * 124)
+    
     for sub_name, (te_eeg, te_ya, te_yb, cal_eeg, cal_ya, cal_yb) in subject_test_data.items():
-        zero_acc, n_wins_5s = evaluate_windows(model, te_eeg, te_ya, te_yb, win_5s_smp, device, streaming_context=False)
-        stream_zero, _ = evaluate_windows(model, te_eeg, te_ya, te_yb, win_5s_smp, device, streaming_context=True)
-        if args.adapt and cal_eeg:
-            eval_model = adapt_subject_spatial(
-                model, cal_eeg, cal_ya, cal_yb, win_5s_smp, int(args.hop_sec * FS), device,
-                epochs=args.calib_epochs, lr=args.calib_lr,
-                loss_type=args.loss, loss_temp=args.loss_temp, margin=args.margin
-            )
-            adapt_acc_5s, _ = evaluate_windows(eval_model, te_eeg, te_ya, te_yb, win_5s_smp, device, streaming_context=False)
-            stream_acc_5s, _ = evaluate_windows(eval_model, te_eeg, te_ya, te_yb, win_5s_smp, device, streaming_context=True)
-        else:
-            eval_model = model
-            adapt_acc_5s = zero_acc
-            stream_acc_5s = stream_zero
-            
-        adapt_acc_10s, _ = evaluate_windows(eval_model, te_eeg, te_ya, te_yb, win_10s_smp, device)
-        adapt_acc_20s, _ = evaluate_windows(eval_model, te_eeg, te_ya, te_yb, win_20s_smp, device)
-            
         s_key = sub_name.split("_")[0].upper()
         base_acc = BASELINE_5S.get(s_key, 65.7)
-        gain = adapt_acc_5s - base_acc
-        gain_str = f"+{gain:.2f}%" if gain >= 0 else f"{gain:.2f}%"
-        subject_results[sub_name] = {
-            "zero_shot_5s": round(zero_acc, 2),
-            "adapted_5s": round(adapt_acc_5s, 2),
-            "streaming_5s": round(stream_acc_5s, 2),
-            "adapted_10s": round(adapt_acc_10s, 2),
-            "adapted_20s": round(adapt_acc_20s, 2),
-            "baseline_5s": round(base_acc, 2),
-            "gain_5s": round(gain, 2),
-            "test_windows_5s": n_wins_5s
-        }
-        cohort_accs_5s.append(adapt_acc_5s)
-        cohort_accs_stream_5s.append(stream_acc_5s)
-        cohort_accs_10s.append(adapt_acc_10s)
-        cohort_accs_20s.append(adapt_acc_20s)
-        print(f"  {sub_name:<16} | {zero_acc:5.1f}%         | {adapt_acc_5s:5.1f}%       | {stream_acc_5s:5.1f}%         | {adapt_acc_10s:5.1f}%     | {adapt_acc_20s:5.1f}%     | {base_acc:5.1f}%        | {gain_str:<10}")
         
-    mean_5s = float(np.mean(cohort_accs_5s)) if cohort_accs_5s else 0.0
-    mean_stream_5s = float(np.mean(cohort_accs_stream_5s)) if cohort_accs_stream_5s else 0.0
-    mean_10s = float(np.mean(cohort_accs_10s)) if cohort_accs_10s else 0.0
-    mean_20s = float(np.mean(cohort_accs_20s)) if cohort_accs_20s else 0.0
-    print("-" * 116)
-    print(f"  GRAND COHORT MEAN ACCURACIES across {len(subject_results)} subjects:")
-    print(f"    •  5.0s Isolated Window (Cold-Start):  {mean_5s:.2f}% (Canonical Single-Band Baseline: 65.7%)")
-    print(f"    •  5.0s Streaming Window (Buffer Context): {mean_stream_5s:.2f}% (Real-World Deployment)")
-    print(f"    • 10.0s Window 2AFC Accuracy:          {mean_10s:.2f}% (Canonical Single-Band Baseline: 74.1%)")
-    print(f"    • 20.0s Window 2AFC Accuracy:          {mean_20s:.2f}% (Canonical Single-Band Baseline: 79.6%)")
-    print("=" * 116)
+        # --- Tier 1: Raw Zero-Shot 5.0s Decoder (Streaming Margins) ---
+        zs_margins, zs_labels, _ = evaluate_streaming_trials(
+            model, None, te_eeg, te_ya, te_yb, window_sec=args.window_sec, step_sec=args.gate_step_sec, fs=FS, device=device
+        )
+        if zs_margins:
+            flat_zs_m = np.concatenate(zs_margins)
+            flat_zs_l = np.concatenate(zs_labels)
+            gt_test_str = np.where(flat_zs_l == 1, "A", "B")
+            t1_preds = np.where(flat_zs_m >= 0, "A", "B")
+            m_t1 = calculate_selective_metrics(t1_preds, gt_test_str)
+            t1_acc = m_t1["selective_accuracy"] * 100.0
+            t1_fsw = float(np.mean([
+                compute_temporal_stability_metrics(np.where(m >= 0, "A", "B"), np.where(l == 1, "A", "B"), args.gate_step_sec)["false_switches_per_minute"]
+                for m, l in zip(zs_margins, zs_labels)
+            ]))
+        else:
+            t1_acc, t1_fsw = 50.0, 0.0
+            gt_test_str = np.array([])
+            
+        # --- Tier 2: Dedicated 64-Parameter Spatial Adapter Training ---
+        if args.adapt and cal_eeg:
+            adapter = train_subject_spatial_adapter(
+                model, cal_eeg, cal_ya, cal_yb, win_5s_smp, int(args.hop_sec * FS), device,
+                epochs=args.calib_epochs, lr=args.calib_lr, l2_identity=args.l2_identity, n_channels=n_ch
+            )
+        else:
+            adapter = SpatialEEGAdapter(channels=n_ch).to(device)
+            
+        ad_margins, ad_labels, ad_raw_eeg = evaluate_streaming_trials(
+            model, adapter, te_eeg, te_ya, te_yb, window_sec=args.window_sec, step_sec=args.gate_step_sec, fs=FS, device=device
+        )
+        if ad_margins:
+            flat_ad_m = np.concatenate(ad_margins)
+            t2_preds = np.where(flat_ad_m >= 0, "A", "B")
+            m_t2 = calculate_selective_metrics(t2_preds, gt_test_str)
+            t2_acc = m_t2["selective_accuracy"] * 100.0
+            t2_fsw = float(np.mean([
+                compute_temporal_stability_metrics(np.where(m >= 0, "A", "B"), np.where(l == 1, "A", "B"), args.gate_step_sec)["false_switches_per_minute"]
+                for m, l in zip(ad_margins, ad_labels)
+            ]))
+            raw_gain_pp = t2_acc - t1_acc
+        else:
+            t2_acc, t2_fsw, raw_gain_pp = t1_acc, t1_fsw, 0.0
+            
+        # --- Tier 3: Adapted 8x8 + Sticky Hysteresis Gate ---
+        t3_dec_list = []
+        t3_gains_attended = []
+        for m_seq, eeg_trial in zip(ad_margins, ad_raw_eeg):
+            gate = StickyHysteresisGate(
+                alpha=args.gate_alpha,
+                threshold_switch=args.gate_switch,
+                threshold_maintain=args.gate_maintain,
+                n_confirm=2,
+                deadband_timeout_steps=24,
+                temperature=1.0
+            )
+            trial_decs = []
+            trial_gains = []
+            for v, w_eeg in zip(m_seq, eeg_trial):
+                sq = sq_monitor.check_eeg_window(w_eeg)
+                out = gate.update(v, is_artifact=not sq["is_valid"])
+                trial_decs.append(out["decision"])
+                trial_gains.append(out["gain_a"])
+            t3_dec_list.append(np.array(trial_decs))
+            t3_gains_attended.append(np.array(trial_gains))
+            
+        if t3_dec_list and len(np.concatenate(t3_dec_list)) > 0:
+            flat_t3 = np.concatenate(t3_dec_list)
+            m_t3 = calculate_selective_metrics(flat_t3, gt_test_str)
+            t3_acc = m_t3["selective_accuracy"] * 100.0 if m_t3["accepted_count"] > 0 else t2_acc
+            t3_cov = float(np.mean(np.concatenate(t3_gains_attended) >= 0.80) * 100.0)
+            t3_hold = m_t3["abstention_rate"] * 100.0
+            t3_fsw = float(np.mean([
+                compute_temporal_stability_metrics(d, np.where(l == 1, "A", "B"), args.gate_step_sec)["false_switches_per_minute"]
+                for d, l in zip(t3_dec_list, ad_labels)
+            ]))
+        else:
+            t3_acc, t3_cov, t3_hold, t3_fsw = t2_acc, 0.0, 0.0, t2_fsw
+            
+        # --- Multi-Scale 10s & 20s Window Accuracies ---
+        acc_10s, _ = evaluate_windows(model, te_eeg, te_ya, te_yb, win_10s_smp, device, adapter=adapter)
+        acc_20s, _ = evaluate_windows(model, te_eeg, te_ya, te_yb, win_20s_smp, device, adapter=adapter)
+        
+        subject_results[sub_name] = {
+            "tier1_zero_shot_5s": round(t1_acc, 2),
+            "tier1_false_switches_5s": round(t1_fsw, 2),
+            "tier2_adapted_5s": round(t2_acc, 2),
+            "tier2_delta_raw_pp": round(raw_gain_pp, 2),
+            "tier2_false_switches_5s": round(t2_fsw, 2),
+            "tier3_sticky_gated_5s": round(t3_acc, 2),
+            "tier3_useful_boost_cov": round(t3_cov, 2),
+            "tier3_hold_rate": round(t3_hold, 2),
+            "tier3_false_switches_5s": round(t3_fsw, 2),
+            "multiscale_10s": round(acc_10s, 2),
+            "multiscale_20s": round(acc_20s, 2),
+            "baseline_5s": round(base_acc, 2),
+            "net_gain_over_baseline": round(t3_acc - base_acc, 2)
+        }
+        
+        cohort_t1_acc.append(t1_acc)
+        cohort_t1_fsw.append(t1_fsw)
+        cohort_t2_acc.append(t2_acc)
+        cohort_t2_gain.append(raw_gain_pp)
+        cohort_t2_fsw.append(t2_fsw)
+        cohort_t3_acc.append(t3_acc)
+        cohort_t3_cov.append(t3_cov)
+        cohort_t3_fsw.append(t3_fsw)
+        cohort_10s.append(acc_10s)
+        cohort_20s.append(acc_20s)
+        
+        print(f"  {s_key:<8} | {t1_acc:>5.1f}% {t1_fsw:>6.2f}/m | {t2_acc:>5.1f}% {raw_gain_pp:>+5.1f} {t2_fsw:>5.2f} | {t3_acc:>5.1f}% {t3_cov:>6.1f}% {t3_fsw:>6.2f}/m | {acc_10s:>5.1f}% | {acc_20s:>5.1f}% | {base_acc:>5.1f}%")
+        
+    if subject_results:
+        m_t1 = float(np.mean(cohort_t1_acc))
+        m_t1_fsw = float(np.mean(cohort_t1_fsw))
+        m_t2 = float(np.mean(cohort_t2_acc))
+        m_t2_gain = float(np.mean(cohort_t2_gain))
+        m_t2_fsw = float(np.mean(cohort_t2_fsw))
+        m_t3 = float(np.mean(cohort_t3_acc))
+        m_t3_cov = float(np.mean(cohort_t3_cov))
+        m_t3_fsw = float(np.mean(cohort_t3_fsw))
+        m_10s = float(np.mean(cohort_10s))
+        m_20s = float(np.mean(cohort_20s))
+        
+        print("  " + "-" * 124)
+        print(f"  {'AVERAGE':<8} | {m_t1:>5.1f}% {m_t1_fsw:>6.2f}/m | {m_t2:>5.1f}% {m_t2_gain:>+5.1f} {m_t2_fsw:>5.2f} | {m_t3:>5.1f}% {m_t3_cov:>6.1f}% {m_t3_fsw:>6.2f}/m | {m_10s:>5.1f}% | {m_20s:>5.1f}% | 65.7%")
+    print("=" * 128)
     
     # Save Metrics JSON
     metrics = {
@@ -757,9 +947,15 @@ def run_multiband_training(args):
         "parameters": n_params,
         "best_val_acc": round(best_val_acc, 2),
         "best_val_loss": round(best_val_loss, 4),
-        "mean_5s_accuracy": round(mean_5s, 2),
-        "mean_10s_accuracy": round(mean_10s, 2),
-        "mean_20s_accuracy": round(mean_20s, 2),
+        "mean_tier1_zero_shot_5s": round(float(np.mean(cohort_t1_acc)), 2) if cohort_t1_acc else 0.0,
+        "mean_tier1_false_switches": round(float(np.mean(cohort_t1_fsw)), 2) if cohort_t1_fsw else 0.0,
+        "mean_tier2_adapted_5s": round(float(np.mean(cohort_t2_acc)), 2) if cohort_t2_acc else 0.0,
+        "mean_tier2_raw_gain_pp": round(float(np.mean(cohort_t2_gain)), 2) if cohort_t2_gain else 0.0,
+        "mean_tier3_sticky_gated_5s": round(float(np.mean(cohort_t3_acc)), 2) if cohort_t3_acc else 0.0,
+        "mean_tier3_useful_boost_cov": round(float(np.mean(cohort_t3_cov)), 2) if cohort_t3_cov else 0.0,
+        "mean_tier3_false_switches": round(float(np.mean(cohort_t3_fsw)), 2) if cohort_t3_fsw else 0.0,
+        "mean_multiscale_10s": round(float(np.mean(cohort_10s)), 2) if cohort_10s else 0.0,
+        "mean_multiscale_20s": round(float(np.mean(cohort_20s)), 2) if cohort_20s else 0.0,
         "subject_accuracies": subject_results,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
@@ -767,7 +963,7 @@ def run_multiband_training(args):
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
     print(f"\n[OUTPUT] Model checkpoint saved to: {resolve_output_path(args.output_model)}")
-    print(f"[OUTPUT] Metrics saved to: {metrics_path}\n")
+    print(f"[OUTPUT] Comprehensive metrics saved to: {metrics_path}\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-Band Cochlear Gammatone + CA-TCN Training")
@@ -801,8 +997,14 @@ if __name__ == "__main__":
     parser.add_argument("--no_broadband", action="store_false", dest="include_broadband", help="Disable broadband envelope inclusion")
     parser.add_argument("--adapt", action="store_true", default=True, help="Enable few-shot spatial adaptation")
     parser.add_argument("--no_adapt", action="store_false", dest="adapt", help="Disable few-shot spatial adaptation")
-    parser.add_argument("--calib_epochs", type=int, default=5, help="Few-shot spatial calibration epochs")
-    parser.add_argument("--calib_lr", type=float, default=1.5e-4, help="Learning rate for spatial calibration")
+    parser.add_argument("--calib_trials", type=int, default=12, help="Number of calibration trials for few-shot spatial adaptation")
+    parser.add_argument("--calib_epochs", type=int, default=15, help="Few-shot spatial calibration epochs for 64-parameter adapter")
+    parser.add_argument("--calib_lr", type=float, default=1e-3, help="Learning rate for 64-parameter spatial adapter")
+    parser.add_argument("--l2_identity", type=float, default=0.05, help="Frobenius identity shrinkage regularization weight")
+    parser.add_argument("--gate_alpha", type=float, default=0.85, help="Exponential moving average factor for Sticky Hysteresis Gate")
+    parser.add_argument("--gate_switch", type=float, default=0.35, help="Switching margin threshold theta_switch")
+    parser.add_argument("--gate_maintain", type=float, default=0.15, help="Retention margin threshold theta_maintain")
+    parser.add_argument("--gate_step_sec", type=float, default=0.5, help="Streaming step size in seconds (2 Hz control rate)")
     parser.add_argument("--eeg_dir", type=str, default=None)
     parser.add_argument("--audio_dir", type=str, default=None)
     parser.add_argument("--audio_env_file", type=str, default=None)
