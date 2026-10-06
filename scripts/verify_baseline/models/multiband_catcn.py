@@ -84,21 +84,22 @@ class SincConvEEG(nn.Module):
         self.sample_rate = sample_rate
         self.nyquist = sample_rate / 2.0
         
-        # 8 Canonical Biological EEG Bands:
-        # 1. Low Delta (0.5 - 2.0 Hz) - Phrase/prosodic tracking
-        # 2. High Delta (2.0 - 4.0 Hz) - Syllable grouping
-        # 3. Low Theta (4.0 - 6.0 Hz) - Acoustic syllable boundaries
-        # 4. High Theta (6.0 - 8.0 Hz) - Phonemic envelope rate
-        # 5. Low Alpha (8.0 - 10.5 Hz) - Auditory attentional gating
-        # 6. High Alpha (10.5 - 13.0 Hz) - Parietal alpha suppression
-        # 7. Low Beta (13.0 - 20.0 Hz) - Temporal prediction
-        # 8. Mid Beta (20.0 - 30.0 Hz) - Motor/auditory integration
-        f1_init_hz = torch.tensor([0.5, 2.0, 4.0, 6.0, 8.0, 10.5, 13.0, 20.0])
-        f2_init_hz = torch.tensor([2.0, 4.0, 6.0, 8.0, 10.5, 13.0, 20.0, 30.0])
+        # 8 High-Resolution Biological Auditory Tracking Bands in 1.0 - 6.5 Hz:
+        # Resolves fine-grained cortical envelope tracking rhythms across the active speech passband:
+        # Band 1: 1.00 - 1.60 Hz (Phrase / prosody tracking)
+        # Band 2: 1.60 - 2.30 Hz (Slow syllabic grouping)
+        # Band 3: 2.30 - 3.00 Hz (Word stress envelope)
+        # Band 4: 3.00 - 3.70 Hz (Mean syllable rate)
+        # Band 5: 3.70 - 4.40 Hz (Conversational syllabic peak)
+        # Band 6: 4.40 - 5.10 Hz (Phonemic boundary transitions)
+        # Band 7: 5.10 - 5.80 Hz (Fast syllable rate)
+        # Band 8: 5.80 - 6.50 Hz (Upper syllabic modulation)
+        f1_init_hz = torch.tensor([1.00, 1.60, 2.30, 3.00, 3.70, 4.40, 5.10, 5.80])
+        f2_init_hz = torch.tensor([1.60, 2.30, 3.00, 3.70, 4.40, 5.10, 5.80, 6.50])
         band_init_hz = f2_init_hz - f1_init_hz
         
-        self.min_low_hz = 0.2
-        self.min_band_hz = 1.0
+        self.min_low_hz = 0.5
+        self.min_band_hz = 0.3
         
         f1_norm = (f1_init_hz - self.min_low_hz) / (self.nyquist - self.min_low_hz - self.min_band_hz + 1e-6)
         f1_norm = torch.clamp(f1_norm, 1e-4, 1.0 - 1e-4)
@@ -235,7 +236,7 @@ class BilinearCrossCorrelationHead(nn.Module):
     2. Strict Anti-Symmetry: Delta(A, B) = -Delta(B, A).
     3. Physiological ERP Focus: Focuses on physiological causal delays (N100, P200).
     """
-    def __init__(self, hidden_dim: int = 64, min_lag: int = -2, max_lag: int = 18, head_type: str = "factored"):
+    def __init__(self, hidden_dim: int = 64, min_lag: int = -2, max_lag: int = 18, head_type: str = "linear"):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.min_lag = min_lag
@@ -310,7 +311,7 @@ class SincMultiBandCATCNDecoder(nn.Module):
         sinc_bands: int = 8,
         min_lag: int = -2,
         max_lag: int = 18,
-        head_type: str = "factored",
+        head_type: str = "linear",
         dropout: float = 0.2
     ):
         super().__init__()
@@ -388,7 +389,7 @@ class MultiBandCATCNDecoder(nn.Module):
         hidden_dim: int = 64,
         max_lag_samples: int = 8,
         min_lag_samples: int = -2,
-        head_type: str = "factored",
+        head_type: str = "linear",
         dropout: float = 0.2,
         use_sinc: bool = True
     ):
