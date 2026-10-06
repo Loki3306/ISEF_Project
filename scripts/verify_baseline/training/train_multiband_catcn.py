@@ -670,7 +670,7 @@ def run_multiband_training(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-Band Cochlear Gammatone + CA-TCN Training")
-    parser.add_argument("--montage", type=str, default="dtu_8ch", choices=list(MONTAGES.keys()))
+    parser.add_argument("--montage", type=str, default="near_ear_expanded", choices=list(MONTAGES.keys()))
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
