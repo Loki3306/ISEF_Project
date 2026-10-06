@@ -386,6 +386,12 @@ def run_multiband_training(args):
             ya_c = (ya_c - np.mean(ya_c, axis=-1, keepdims=True)) / (np.std(ya_c, axis=-1, keepdims=True) + 1e-12)
             yb_c = (yb_c - np.mean(yb_c, axis=-1, keepdims=True)) / (np.std(yb_c, axis=-1, keepdims=True) + 1e-12)
             
+            if args.include_broadband:
+                bb_a = np.mean(ya_c, axis=0, keepdims=True)
+                bb_b = np.mean(yb_c, axis=0, keepdims=True)
+                ya_c = np.concatenate([bb_a, ya_c], axis=0)
+                yb_c = np.concatenate([bb_b, yb_c], axis=0)
+            
             # IN DTU: wavA (ya_c) is ALWAYS attended, wavB (yb_c) is ALWAYS unattended
             if idx < split_idx:
                 total_train_trials += 1
@@ -469,9 +475,10 @@ def run_multiband_training(args):
     )
     
     # 4. Instantiate Multi-Band CA-TCN Model
+    audio_in_channels = args.audio_bands + (1 if args.include_broadband else 0)
     model = MultiBandCATCNDecoder(
         eeg_channels=n_ch,
-        audio_bands=args.audio_bands,
+        audio_bands=audio_in_channels,
         hidden_dim=args.hidden_dim,
         max_lag_samples=args.max_lag_samples,
         dropout=args.dropout
@@ -508,7 +515,7 @@ def run_multiband_training(args):
             
             # Subband SpecAugment (mask 1 random band with p=args.subband_mask_prob to prevent relying on single subband noise)
             if args.subband_mask_prob > 0 and np.random.rand() < args.subband_mask_prob:
-                mb = np.random.randint(0, args.audio_bands)
+                mb = np.random.randint(0, audio_in_channels)
                 bya = bya.clone()
                 byb = byb.clone()
                 bya[:, mb, :] = 0.0
@@ -676,6 +683,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_lag_samples", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.35)
     parser.add_argument("--subband_mask_prob", type=float, default=0.25)
+    parser.add_argument("--include_broadband", action="store_true", default=True, help="Include 1D broadband envelope as Channel 0 alongside 8 Gammatone subbands")
+    parser.add_argument("--no_broadband", action="store_false", dest="include_broadband", help="Disable broadband envelope inclusion")
     parser.add_argument("--adapt", action="store_true", default=True, help="Enable few-shot spatial adaptation")
     parser.add_argument("--no_adapt", action="store_false", dest="adapt", help="Disable few-shot spatial adaptation")
     parser.add_argument("--calib_epochs", type=int, default=10, help="Few-shot spatial calibration epochs")
