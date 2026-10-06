@@ -103,8 +103,11 @@ def evaluate_windows(model, eeg_list, ya_list, yb_list, window_samples, device, 
                 for s in range(0, t_len - window_samples + 1, window_samples):
                     e = s + window_samples
                     delta, (la, lb) = model.classifier_head(z_eeg[:, :, s:e], z_a[:, :, s:e], z_b[:, :, s:e])
-                    if delta.item() > 0.0:
-                        correct_wins += 1
+                    val = delta.item()
+                    if abs(val) < 1e-6:
+                        correct_wins += 0.5
+                    elif val > 0.0:
+                        correct_wins += 1.0
                     total_wins += 1
             else:
                 for s in range(0, t_len - window_samples + 1, window_samples):
@@ -115,8 +118,11 @@ def evaluate_windows(model, eeg_list, ya_list, yb_list, window_samples, device, 
                     if adapter is not None:
                         w_e = adapter(w_e)
                     delta, (la, lb), _ = model(w_e, w_a, w_b)
-                    if delta.item() > 0.0:
-                        correct_wins += 1
+                    val = delta.item()
+                    if abs(val) < 1e-6:
+                        correct_wins += 0.5
+                    elif val > 0.0:
+                        correct_wins += 1.0
                     total_wins += 1
                     
     if total_wins == 0:
@@ -136,18 +142,19 @@ def train_subject_spatial_adapter(
     lr: float = 1e-3,
     l2_identity: float = 0.05,
     n_channels: int = 8,
-) -> SpatialEEGAdapter:
+) -> tuple[SpatialEEGAdapter, float]:
     """
     Trains the dedicated 64-parameter SpatialEEGAdapter (W in R^{8x8}) on calibration trials
     while keeping the entire Sinc-CATCN backbone 100% frozen.
     Features:
     - Frobenius identity regularization: ||W - I_8||_F^2 (shrinkage towards unadapted baseline).
     - Symmetric dual-target augmentation: (x, ya, yb) -> 1.0, (x, yb, ya) -> 0.0.
-    - Safe-revert fallback: if adapted calibration accuracy drops below identity, resets to identity.
+    - Convex shrinkage optimization across lambda in [0.0, 1.0] to prevent over-rotation.
+    - Platt margin temperature calibration for subject-specific adaptive gating.
     """
     adapter = SpatialEEGAdapter(channels=n_channels).to(device)
     if not calib_eeg:
-        return adapter
+        return adapter, 1.0
         
     x_list, ya_list, yb_list = [], [], []
     for eeg, ya, yb in zip(calib_eeg, calib_ya, calib_yb):
@@ -169,7 +176,7 @@ def train_subject_spatial_adapter(
             s += hop_samples
             
     if not x_list:
-        return adapter
+        return adapter, 1.0
         
     x_arr = np.stack(x_list, axis=0)
     ya_arr = np.stack(ya_list, axis=0)
@@ -222,19 +229,50 @@ def train_subject_spatial_adapter(
             loss.backward()
             optimizer.step()
             
+    # Safe Convex Shrinkage Optimization: evaluate lambda in [0.0, 0.25, 0.5, 0.75, 1.0]
+    W_trained = adapter.proj.weight.data.clone()
+    eye = torch.eye(n_channels, device=device).unsqueeze(-1)
+    
+    best_lam = 0.0
+    best_loss = float('inf')
+    best_acc = -1.0
+    
+    candidate_lams = [0.0, 0.25, 0.5, 0.75, 1.0]
     adapter.eval()
     with torch.no_grad():
-        post_correct = 0
-        for bx, bya, byb, blab in loader:
-            bx, bya, byb, blab = bx.to(device), bya.to(device), byb.to(device), blab.to(device)
-            d, _, _ = base_model(adapter(bx), bya, byb)
-            post_correct += int(((d > 0.0) == (blab > 0.5)).sum().item())
+        for lam in candidate_lams:
+            adapter.proj.weight.data.copy_((1.0 - lam) * eye + lam * W_trained)
+            cur_loss = 0.0
+            cur_correct = 0
+            n_tot = 0
+            for bx, bya, byb, blab in loader:
+                bx, bya, byb, blab = bx.to(device), bya.to(device), byb.to(device), blab.to(device)
+                d, _, _ = base_model(adapter(bx), bya, byb)
+                cur_loss += F.binary_cross_entropy_with_logits(d, blab, reduction='sum').item()
+                cur_correct += int(((d > 0.0) == (blab > 0.5)).sum().item())
+                n_tot += bx.size(0)
             
-    # Guarantee safe adaptation: revert to identity if calibration accuracy degraded
-    if post_correct < init_correct:
-        adapter.reset_to_identity()
-        
-    return adapter
+            acc = cur_correct / max(1, n_tot)
+            if acc > best_acc or (abs(acc - best_acc) < 1e-4 and cur_loss < best_loss):
+                best_acc = acc
+                best_loss = cur_loss
+                best_lam = lam
+                
+    # Lock optimal shrunk adapter
+    adapter.proj.weight.data.copy_((1.0 - best_lam) * eye + best_lam * W_trained)
+    
+    # Calculate subject-specific margin scale / temperature from calibration data
+    cal_margins = []
+    with torch.no_grad():
+        for bx, bya, byb, blab in loader:
+            bx, bya, byb = bx.to(device), bya.to(device), byb.to(device)
+            d, _, _ = base_model(adapter(bx), bya, byb)
+            cal_margins.extend(d.cpu().numpy().tolist())
+    cal_m = np.array(cal_margins)
+    cal_std = float(np.std(cal_m)) if len(cal_m) > 1 else 1.0
+    cal_temp = float(np.clip(cal_std, 0.6, 2.0))
+    
+    return adapter, cal_temp
 
 def evaluate_streaming_trials(
     model: nn.Module,
@@ -659,12 +697,35 @@ def run_multiband_training(args):
     best_val_loss = float('inf')
     best_weights = deepcopy(model.state_dict())
     
+    # Checkpoint pre-loading if provided
+    if args.checkpoint_path:
+        ckpt_candidate = Path(args.checkpoint_path)
+        if ckpt_candidate.exists():
+            print(f"\n[CHECKPOINT]: Loading pre-trained weights from {ckpt_candidate}...")
+            st = torch.load(ckpt_candidate, map_location=device, weights_only=False)
+            if "model_state_dict" in st:
+                st = st["model_state_dict"]
+            if any(k.startswith("model.") for k in st.keys()) and not any(k.startswith("model.") for k in model.state_dict().keys()):
+                st = {k[6:]: v for k, v in st.items()}
+            elif not any(k.startswith("model.") for k in st.keys()) and any(k.startswith("model.") for k in model.state_dict().keys()):
+                st = {f"model.{k}": v for k, v in st.items()}
+            model.load_state_dict(st, strict=True)
+            best_weights = deepcopy(model.state_dict())
+            print("  --> Pre-trained checkpoint loaded successfully.")
+        else:
+            print(f"\n[WARNING]: Specified checkpoint {ckpt_candidate} not found on disk.")
+
     # 5. Training Loop
-    print("\n" + "=" * 96)
-    print(f"  COMMENCING {model_tag.upper()} TRAINING ({args.epochs} EPOCHS)")
-    print("=" * 96)
+    if args.eval_only:
+        print("\n" + "=" * 96)
+        print("  [EVAL ONLY MODE]: Skipping backbone training, evaluating loaded checkpoint directly.")
+        print("=" * 96)
+    else:
+        print("\n" + "=" * 96)
+        print(f"  COMMENCING {model_tag.upper()} TRAINING ({args.epochs} EPOCHS)")
+        print("=" * 96)
     
-    for epoch in range(1, args.epochs + 1):
+    for epoch in ([] if args.eval_only else range(1, args.epochs + 1)):
         t_epoch_start = time.time()
         model.train()
         train_loss = 0.0
@@ -824,12 +885,13 @@ def run_multiband_training(args):
             
         # --- Tier 2: Dedicated 64-Parameter Spatial Adapter Training ---
         if args.adapt and cal_eeg:
-            adapter = train_subject_spatial_adapter(
+            adapter, cal_temp = train_subject_spatial_adapter(
                 model, cal_eeg, cal_ya, cal_yb, win_5s_smp, int(args.hop_sec * FS), device,
                 epochs=args.calib_epochs, lr=args.calib_lr, l2_identity=args.l2_identity, n_channels=n_ch
             )
         else:
             adapter = SpatialEEGAdapter(channels=n_ch).to(device)
+            cal_temp = 1.0
             
         ad_margins, ad_labels, ad_raw_eeg = evaluate_streaming_trials(
             model, adapter, te_eeg, te_ya, te_yb, window_sec=args.window_sec, step_sec=args.gate_step_sec, fs=FS, device=device
@@ -853,11 +915,11 @@ def run_multiband_training(args):
         for m_seq, eeg_trial in zip(ad_margins, ad_raw_eeg):
             gate = StickyHysteresisGate(
                 alpha=args.gate_alpha,
-                threshold_switch=args.gate_switch,
-                threshold_maintain=args.gate_maintain,
+                threshold_switch=args.gate_switch * cal_temp,
+                threshold_maintain=args.gate_maintain * cal_temp,
                 n_confirm=2,
                 deadband_timeout_steps=24,
-                temperature=1.0
+                temperature=cal_temp
             )
             trial_decs = []
             trial_gains = []
@@ -883,8 +945,8 @@ def run_multiband_training(args):
             t3_acc, t3_cov, t3_hold, t3_fsw = t2_acc, 0.0, 0.0, t2_fsw
             
         # --- Multi-Scale 10s & 20s Window Accuracies ---
-        acc_10s, _ = evaluate_windows(model, te_eeg, te_ya, te_yb, win_10s_smp, device, adapter=adapter)
-        acc_20s, _ = evaluate_windows(model, te_eeg, te_ya, te_yb, win_20s_smp, device, adapter=adapter)
+        acc_10s, _ = evaluate_windows(model, te_eeg, te_ya, te_yb, win_10s_smp, device, adapter=adapter, streaming_context=args.streaming_context)
+        acc_20s, _ = evaluate_windows(model, te_eeg, te_ya, te_yb, win_20s_smp, device, adapter=adapter, streaming_context=args.streaming_context)
         
         subject_results[sub_name] = {
             "tier1_zero_shot_5s": round(t1_acc, 2),
@@ -1008,6 +1070,9 @@ if __name__ == "__main__":
     parser.add_argument("--eeg_dir", type=str, default=None)
     parser.add_argument("--audio_dir", type=str, default=None)
     parser.add_argument("--audio_env_file", type=str, default=None)
+    parser.add_argument("--checkpoint_path", type=str, default=None, help="Pre-trained checkpoint to load")
+    parser.add_argument("--eval_only", action="store_true", help="Skip backbone training and execute adaptation and multi-tier benchmark directly")
+    parser.add_argument("--streaming_context", action="store_true", help="Enable continuous streaming context for multi-scale 10s and 20s windows")
     parser.add_argument("--output_model", type=str, default="/kaggle/working/sinc_multiband_catcn_best.pt")
     parser.add_argument("--output_metrics", type=str, default="/kaggle/working/sinc_multiband_catcn_metrics.json")
     parser.add_argument("--smoke_test", action="store_true", help="Run rapid CPU smoke test")
