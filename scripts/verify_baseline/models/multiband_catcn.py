@@ -236,13 +236,21 @@ class BilinearCrossCorrelationHead(nn.Module):
     2. Strict Anti-Symmetry: Delta(A, B) = -Delta(B, A).
     3. Physiological ERP Focus: Focuses on physiological causal delays (N100, P200).
     """
-    def __init__(self, hidden_dim: int = 64, min_lag: int = -2, max_lag: int = 18, head_type: str = "linear"):
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        min_lag: int = -2,
+        max_lag: int = 18,
+        head_type: str = "linear",
+        head_dropout: float = 0.25
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.min_lag = min_lag
         self.max_lag = max_lag
         self.num_lags = max_lag - min_lag + 1
         self.head_type = head_type
+        self.dropout = nn.Dropout(head_dropout)
         
         if head_type == "factored":
             self.channel_weight = nn.Parameter(torch.ones(hidden_dim) / math.sqrt(hidden_dim))
@@ -288,6 +296,7 @@ class BilinearCrossCorrelationHead(nn.Module):
             return self.scale * score
         else:
             r_all = torch.stack(corrs, dim=-1).view(B, -1) # [B, D * num_lags]
+            r_all = self.dropout(r_all)
             return self.classifier(r_all).squeeze(-1)
         
     def forward(self, z_eeg: torch.Tensor, z_a: torch.Tensor, z_b: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
@@ -312,7 +321,8 @@ class SincMultiBandCATCNDecoder(nn.Module):
         min_lag: int = -2,
         max_lag: int = 18,
         head_type: str = "linear",
-        dropout: float = 0.2
+        dropout: float = 0.2,
+        head_dropout: float = 0.25
     ):
         super().__init__()
         self.eeg_channels = eeg_channels
@@ -336,7 +346,8 @@ class SincMultiBandCATCNDecoder(nn.Module):
             hidden_dim=hidden_dim,
             min_lag=min_lag,
             max_lag=max_lag,
-            head_type=head_type
+            head_type=head_type,
+            head_dropout=head_dropout
         )
         
     def forward(
@@ -391,6 +402,7 @@ class MultiBandCATCNDecoder(nn.Module):
         min_lag_samples: int = -2,
         head_type: str = "linear",
         dropout: float = 0.2,
+        head_dropout: float = 0.25,
         use_sinc: bool = True
     ):
         super().__init__()
@@ -403,7 +415,8 @@ class MultiBandCATCNDecoder(nn.Module):
                 min_lag=min_lag_samples,
                 max_lag=max_lag_samples,
                 head_type=head_type,
-                dropout=dropout
+                dropout=dropout,
+                head_dropout=head_dropout
             )
         else:
             self.model = MultiBandCATCNDecoder_Baseline(
