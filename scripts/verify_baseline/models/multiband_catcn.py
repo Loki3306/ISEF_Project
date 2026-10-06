@@ -363,6 +363,201 @@ class SincMultiBandCATCNDecoder(nn.Module):
         delta, (logit_a, logit_b) = self.classifier_head(z_eeg, z_a, z_b)
         return delta, (logit_a, logit_b), (z_eeg, z_a, z_b)
 
+# =========================================================================
+# V3 ARCHITECTURE: MSCA-CATCN (Multi-Scale Cross-Attention Conformer)
+# =========================================================================
+
+class BilateralSpatialBeamformer(nn.Module):
+    """
+    Near-Ear Bilateral Dipole Spatial Beamformer.
+    Extracts 4 differential dipole signals across symmetric left-right electrode pairs:
+    (T7, T8), (TP7, TP8), (CP5, CP6), (FC5, FC6).
+    Appends the 4 dipoles to the 8 raw monopolar channels (total 12 channels)
+    and decomposes all 12 channels through Biological SincNet filterbanks.
+    """
+    def __init__(self, in_channels: int = 8, sinc_bands: int = 8, hidden_dim: int = 64):
+        super().__init__()
+        self.pairs = [(0, 1), (2, 3), (4, 5), (6, 7)]
+        self.sinc_filter = SincConvEEG(out_bands=sinc_bands, kernel_size=65, sample_rate=64.0)
+        total_in = sinc_bands * (in_channels + len(self.pairs))
+        self.spatial_proj = nn.Conv1d(total_in, hidden_dim, kernel_size=1, bias=False)
+        self.bn_spatial = nn.BatchNorm1d(hidden_dim)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dipoles = [x[:, i:i+1, :] - x[:, j:j+1, :] for (i, j) in self.pairs]
+        x_aug = torch.cat([x] + dipoles, dim=1) # [B, 12, T]
+        sinc_feats = self.sinc_filter(x_aug) # [B, sinc_bands * 12, T]
+        return F.elu(self.bn_spatial(self.spatial_proj(sinc_feats)))
+
+class MultiScaleDirectionalDepthwiseConv1d(nn.Module):
+    """
+    Tri-scale directional depthwise convolution (kernels 3, 7, 11).
+    Captures phonemic (47 ms), syllabic (109 ms), and word/prosodic (172 ms)
+    temporal dynamics in parallel without extra parameter bloat.
+    """
+    def __init__(self, channels: int, kernels=[3, 7, 11], dilation: int = 1, direction: str = 'causal'):
+        super().__init__()
+        self.direction = direction
+        self.branches = nn.ModuleList()
+        c_per = channels // len(kernels)
+        self.c_per = c_per
+        self.rem = channels - c_per * len(kernels)
+        for i, k in enumerate(kernels):
+            c_branch = c_per + (self.rem if i == len(kernels)-1 else 0)
+            pad = (k - 1) * dilation
+            self.branches.append(nn.Sequential(
+                nn.ConstantPad1d((pad, 0) if direction == 'causal' else (0, pad), 0.0),
+                nn.Conv1d(c_branch, c_branch, kernel_size=k, dilation=dilation, groups=c_branch, bias=False)
+            ))
+            
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        splits = [self.c_per] * (len(self.branches) - 1) + [self.c_per + self.rem]
+        xs = torch.split(x, splits, dim=1)
+        outs = [b(chunk) for b, chunk in zip(self.branches, xs)]
+        return torch.cat(outs, dim=1)
+
+class MultiScaleDepthwiseSeparableTCNBlock(nn.Module):
+    def __init__(self, channels: int, kernels=[3, 7, 11], dilation: int = 1, direction: str = 'causal', dropout: float = 0.2):
+        super().__init__()
+        self.depthwise = MultiScaleDirectionalDepthwiseConv1d(channels, kernels=kernels, dilation=dilation, direction=direction)
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.pointwise = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(channels)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = x
+        out = self.depthwise(x)
+        out = F.elu(self.bn1(out))
+        out = self.pointwise(out)
+        out = self.bn2(out)
+        out = self.dropout(out)
+        return F.elu(out + res)
+
+class MSCA_EEGEncoder(nn.Module):
+    def __init__(self, in_channels=8, hidden_dim=64, sinc_bands=8, dilations=[1, 2, 4], dropout=0.2):
+        super().__init__()
+        self.beamformer = BilateralSpatialBeamformer(in_channels, sinc_bands, hidden_dim)
+        self.blocks = nn.ModuleList([
+            MultiScaleDepthwiseSeparableTCNBlock(hidden_dim, kernels=[3, 7, 11], dilation=d, direction='anticausal', dropout=dropout)
+            for d in dilations
+        ])
+    def forward(self, x):
+        feat = self.beamformer(x)
+        for block in self.blocks:
+            feat = block(feat)
+        return feat
+
+class MSCA_AudioEncoder(nn.Module):
+    def __init__(self, in_channels=9, hidden_dim=64, dilations=[1, 2, 4, 8, 16], dropout=0.2):
+        super().__init__()
+        # Tonotopic Squeeze-and-Excitation Subband Attention
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels, 4),
+            nn.ELU(),
+            nn.Linear(4, in_channels),
+            nn.Sigmoid()
+        )
+        self.spectral_proj = nn.Conv1d(in_channels, hidden_dim, kernel_size=1, bias=False)
+        self.bn_proj = nn.BatchNorm1d(hidden_dim)
+        self.blocks = nn.ModuleList([
+            MultiScaleDepthwiseSeparableTCNBlock(hidden_dim, kernels=[3, 7, 11], dilation=d, direction='causal', dropout=dropout)
+            for d in dilations
+        ])
+        self.latent_proj = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False)
+        self.bn_latent = nn.BatchNorm1d(hidden_dim)
+        
+    def forward(self, x):
+        w = self.se(x).unsqueeze(-1)
+        feat = F.elu(self.bn_proj(self.spectral_proj(x * w)))
+        for block in self.blocks:
+            feat = block(feat)
+        return F.elu(self.bn_latent(self.latent_proj(feat)))
+
+class AttentionCrossCorrelationHead(nn.Module):
+    """
+    Energy-Aware Attention Cross-Correlation Head with Guaranteed Anti-Symmetry.
+    Dynamically weights salient acoustic peaks and downweights pauses without stream bias.
+    """
+    def __init__(self, hidden_dim=64, min_lag=-2, max_lag=18, head_dropout=0.25):
+        super().__init__()
+        self.min_lag = min_lag
+        self.max_lag = max_lag
+        self.num_lags = max_lag - min_lag + 1
+        self.attn_net = nn.Sequential(
+            nn.Conv1d(hidden_dim, 16, kernel_size=1),
+            nn.ELU(),
+            nn.Conv1d(16, 1, kernel_size=1)
+        )
+        self.classifier = nn.Linear(hidden_dim * self.num_lags, 1, bias=False)
+        self.dropout = nn.Dropout(head_dropout)
+        
+    def compute_stream_score(self, z_eeg: torch.Tensor, z_audio: torch.Tensor) -> torch.Tensor:
+        B, D, T = z_eeg.shape
+        ze_norm = (z_eeg - z_eeg.mean(dim=-1, keepdim=True)) / (z_eeg.std(dim=-1, keepdim=True) + 1e-8)
+        za_norm = (z_audio - z_audio.mean(dim=-1, keepdim=True)) / (z_audio.std(dim=-1, keepdim=True) + 1e-8)
+        
+        attn_logits = self.attn_net(z_audio)
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        
+        corrs = []
+        for tau in range(self.min_lag, self.max_lag + 1):
+            if tau > 0:
+                ze_s = ze_norm[:, :, tau:]
+                za_s = za_norm[:, :, :-tau]
+                w_s = attn_weights[:, :, :-tau]
+            elif tau < 0:
+                ze_s = ze_norm[:, :, :tau]
+                za_s = za_norm[:, :, -tau:]
+                w_s = attn_weights[:, :, -tau:]
+            else:
+                ze_s = ze_norm
+                za_s = za_norm
+                w_s = attn_weights
+                
+            w_norm = w_s / (w_s.sum(dim=-1, keepdim=True) + 1e-8)
+            r_tau = (ze_s * za_s * w_norm).sum(dim=-1)
+            corrs.append(r_tau)
+            
+        r_all = self.dropout(torch.stack(corrs, dim=-1).view(B, -1))
+        return self.classifier(r_all).squeeze(-1)
+        
+    def forward(self, z_eeg: torch.Tensor, z_a: torch.Tensor, z_b: torch.Tensor):
+        sa = self.compute_stream_score(z_eeg, z_a)
+        sb = self.compute_stream_score(z_eeg, z_b)
+        return sa - sb, (sa, sb)
+
+class MSCAMultiBandCATCNDecoder(nn.Module):
+    """
+    Multi-Scale Bilateral Sinc-Conformer CA-TCN Decoder (v3).
+    Integrates bilateral dipole beamforming, multi-scale temporal convolutions,
+    tonotopic subband SE attention, and energy-aware cross-correlation.
+    """
+    def __init__(
+        self,
+        eeg_channels: int = 8,
+        audio_bands: int = 9,
+        hidden_dim: int = 64,
+        sinc_bands: int = 8,
+        min_lag: int = -2,
+        max_lag: int = 18,
+        dropout: float = 0.2,
+        head_dropout: float = 0.25
+    ):
+        super().__init__()
+        self.eeg_encoder = MSCA_EEGEncoder(eeg_channels, hidden_dim, sinc_bands, [1, 2, 4], dropout)
+        self.audio_encoder = MSCA_AudioEncoder(audio_bands, hidden_dim, [1, 2, 4, 8, 16], dropout)
+        self.classifier_head = AttentionCrossCorrelationHead(hidden_dim, min_lag, max_lag, head_dropout)
+        
+    def forward(self, eeg, audio_a, audio_b):
+        ze = self.eeg_encoder(eeg)
+        za = self.audio_encoder(audio_a)
+        zb = self.audio_encoder(audio_b)
+        delta, (logit_a, logit_b) = self.classifier_head(ze, za, zb)
+        return delta, (logit_a, logit_b), (ze, za, zb)
+
 # Legacy v1 baseline classes preserved for full backward compatibility
 try:
     from models.frozen_multiband_catcn import (
@@ -390,8 +585,10 @@ except ImportError:
 class MultiBandCATCNDecoder(nn.Module):
     """
     Unified MultiBand CA-TCN Decoder interface.
-    Instantiates SincMultiBandCATCNDecoder by default (use_sinc=True)
-    or FrozenMultiBandCATCNDecoder (use_sinc=False) for exact legacy reproducibility.
+    Supports:
+    - arch='msca': Multi-Scale Bilateral Sinc-Conformer (v3)
+    - arch='sinc' / use_sinc=True: Sinc-CATCN (v2)
+    - arch='baseline' / use_sinc=False: Legacy Baseline (v1)
     """
     def __init__(
         self,
@@ -403,11 +600,24 @@ class MultiBandCATCNDecoder(nn.Module):
         head_type: str = "linear",
         dropout: float = 0.2,
         head_dropout: float = 0.25,
-        use_sinc: bool = True
+        use_sinc: bool = True,
+        arch: str = "sinc"
     ):
         super().__init__()
         self.use_sinc = use_sinc
-        if use_sinc:
+        self.arch = arch
+        if arch == "msca":
+            self.model = MSCAMultiBandCATCNDecoder(
+                eeg_channels=eeg_channels,
+                audio_bands=audio_bands,
+                hidden_dim=hidden_dim,
+                sinc_bands=8,
+                min_lag=min_lag_samples,
+                max_lag=max_lag_samples,
+                dropout=dropout,
+                head_dropout=head_dropout
+            )
+        elif use_sinc or arch == "sinc":
             self.model = SincMultiBandCATCNDecoder(
                 eeg_channels=eeg_channels,
                 audio_bands=audio_bands,

@@ -681,11 +681,12 @@ def run_multiband_training(args):
         head_type=args.head_type,
         dropout=args.dropout,
         head_dropout=args.head_dropout,
-        use_sinc=args.use_sinc
+        use_sinc=args.use_sinc,
+        arch=args.arch
     ).to(device)
     
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    model_tag = "Sinc-CATCN-v2" if args.use_sinc else "MultiBand-CATCN-Baseline"
+    model_tag = "MSCA-CATCN-v3" if args.arch == "msca" else ("Sinc-CATCN-v2" if args.use_sinc else "MultiBand-CATCN-Baseline")
     print(f"\n[MODEL INITIALIZED]: {model_tag} with {n_params:,} trainable parameters.")
     print(f"  Head: {args.head_type} (dropout={args.head_dropout}) | Loss: {args.loss} (margin={args.margin}, tau={args.loss_temp}) | Lags: [{args.min_lag_samples}, {args.max_lag_samples}]")
     
@@ -1070,6 +1071,7 @@ if __name__ == "__main__":
     parser.add_argument("--eeg_dir", type=str, default=None)
     parser.add_argument("--audio_dir", type=str, default=None)
     parser.add_argument("--audio_env_file", type=str, default=None)
+    parser.add_argument("--arch", type=str, default="sinc", choices=["sinc", "msca", "baseline"], help="Model architecture: 'sinc' (v2), 'msca' (v3 multi-scale bilateral conformer), 'baseline' (v1)")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Pre-trained checkpoint to load")
     parser.add_argument("--eval_only", action="store_true", help="Skip backbone training and execute adaptation and multi-tier benchmark directly")
     parser.add_argument("--streaming_context", action="store_true", help="Enable continuous streaming context for multi-scale 10s and 20s windows")
