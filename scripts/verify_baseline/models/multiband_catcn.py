@@ -675,9 +675,29 @@ class MultiBandCATCNDecoder(nn.Module):
     @property
     def classifier_head(self):
         return self.model.classifier_head
+
+    @property
+    def spatial_head(self):
+        if hasattr(self.model, "spatial_head"):
+            return self.model.spatial_head
+        return None
         
-    def forward(self, eeg, audio_a, audio_b):
-        return self.model(eeg, audio_a, audio_b)
+    def forward(self, eeg, audio_a, audio_b, return_spatial: bool = False):
+        if hasattr(self.model, "forward"):
+            import inspect
+            sig = inspect.signature(self.model.forward)
+            if "return_spatial" in sig.parameters:
+                return self.model(eeg, audio_a, audio_b, return_spatial=return_spatial)
+        res = self.model(eeg, audio_a, audio_b)
+        if return_spatial:
+            s_dir = torch.zeros(eeg.size(0), device=eeg.device)
+            return res[0], res[1], res[2], s_dir
+        return res
+
+    def predict_spatial_direction(self, eeg):
+        if hasattr(self.model, "predict_spatial_direction"):
+            return self.model.predict_spatial_direction(eeg)
+        return torch.zeros(eeg.size(0), device=eeg.device)
 
 def print_summary():
     model = MultiBandCATCNDecoder(eeg_channels=8, audio_bands=9, hidden_dim=64, use_sinc=True)

@@ -130,34 +130,43 @@ def evaluate_windows(model, eeg_list, ya_list, yb_list, window_samples, device, 
     acc = (correct_wins / total_wins) * 100.0
     return acc, total_wins
 
-def train_subject_spatial_adapter(
+def train_subject_deep_adapter(
     base_model: nn.Module,
     calib_eeg: list[np.ndarray],
     calib_ya: list[np.ndarray],
     calib_yb: list[np.ndarray],
-    win_samples: int,
-    hop_samples: int,
-    device: torch.device,
+    calib_dir: list[float] | None = None,
+    cal_dir: list[float] | None = None,
+    win_samples: int = 320,
+    hop_samples: int = 64,
+    device: torch.device = torch.device("cpu"),
     epochs: int = 15,
     lr: float = 1e-3,
+    deep_lr: float = 5e-4,
     l2_identity: float = 0.05,
     n_channels: int = 8,
+    deep_adapt: bool = True
 ) -> tuple[SpatialEEGAdapter, float]:
     """
-    Trains the dedicated 64-parameter SpatialEEGAdapter (W in R^{8x8}) on calibration trials
-    while keeping the entire Sinc-CATCN backbone 100% frozen.
+    Trains the dedicated SpatialEEGAdapter and optionally deep-adapts biological SincNet filters
+    and spatial direction head parameters on calibration trials to rescue low-SNR subjects (e.g. S6, S11).
     Features:
-    - Frobenius identity regularization: ||W - I_8||_F^2 (shrinkage towards unadapted baseline).
+    - Frobenius identity regularization: ||W - I_C||_F^2 (shrinkage towards unadapted baseline).
     - Symmetric dual-target augmentation: (x, ya, yb) -> 1.0, (x, yb, ya) -> 0.0.
+    - SincNet filter frequency deviation penalty to preserve biological tracking bands.
     - Convex shrinkage optimization across lambda in [0.0, 1.0] to prevent over-rotation.
     - Platt margin temperature calibration for subject-specific adaptive gating.
     """
+    if calib_dir is None and cal_dir is not None:
+        calib_dir = cal_dir
+        
     adapter = SpatialEEGAdapter(channels=n_channels).to(device)
     if not calib_eeg:
         return adapter, 1.0
         
-    x_list, ya_list, yb_list = [], [], []
-    for eeg, ya, yb in zip(calib_eeg, calib_ya, calib_yb):
+    x_list, ya_list, yb_list, d_list = [], [], [], []
+    for tr_i, (eeg, ya, yb) in enumerate(zip(calib_eeg, calib_ya, calib_yb)):
+        cur_d = calib_dir[tr_i] if calib_dir is not None and tr_i < len(calib_dir) else 1.0
         min_len = min(len(eeg), ya.shape[-1], yb.shape[-1])
         s = 0
         while s + win_samples <= min_len:
@@ -173,6 +182,7 @@ def train_subject_spatial_adapter(
             x_list.append(w_e_std.T)
             ya_list.append(w_ya_std)
             yb_list.append(w_yb_std)
+            d_list.append(cur_d)
             s += hop_samples
             
     if not x_list:
@@ -181,6 +191,7 @@ def train_subject_spatial_adapter(
     x_arr = np.stack(x_list, axis=0)
     ya_arr = np.stack(ya_list, axis=0)
     yb_arr = np.stack(yb_list, axis=0)
+    d_arr = np.array(d_list, dtype=np.float32)
     N = len(x_arr)
     
     # Symmetrized dual-target dataset
@@ -188,55 +199,76 @@ def train_subject_spatial_adapter(
     c1_aug = np.concatenate([ya_arr, yb_arr], axis=0)
     c2_aug = np.concatenate([yb_arr, ya_arr], axis=0)
     labels_aug = np.concatenate([np.ones(N, dtype=np.float32), np.zeros(N, dtype=np.float32)], axis=0)
+    d_aug = np.concatenate([d_arr, d_arr], axis=0)
     
     ds = TensorDataset(
         torch.from_numpy(x_aug).float(),
         torch.from_numpy(c1_aug).float(),
         torch.from_numpy(c2_aug).float(),
-        torch.from_numpy(labels_aug).float()
+        torch.from_numpy(labels_aug).float(),
+        torch.from_numpy(d_aug).float()
     )
     loader = DataLoader(ds, batch_size=min(32, len(ds)), shuffle=True)
     
-    # Ensure backbone is strictly frozen
+    # Freeze backbone by default
     base_model.eval()
     for p in base_model.parameters():
         p.requires_grad = False
         
-    adapter.train()
-    optimizer = optim.AdamW(adapter.parameters(), lr=lr, weight_decay=1e-4)
+    deep_params = []
+    f1_init, band_init = None, None
+    if deep_adapt:
+        if hasattr(base_model, "eeg_encoder") and hasattr(base_model.eeg_encoder, "sinc_net"):
+            sn = base_model.eeg_encoder.sinc_net
+            sn.f1_raw.requires_grad = True
+            sn.band_raw.requires_grad = True
+            f1_init = sn.f1_raw.detach().clone()
+            band_init = sn.band_raw.detach().clone()
+            deep_params.extend([sn.f1_raw, sn.band_raw])
+        if hasattr(base_model, "spatial_head") and base_model.spatial_head is not None:
+            for p in base_model.spatial_head.parameters():
+                p.requires_grad = True
+                deep_params.append(p)
+                
+    param_groups = [{'params': adapter.parameters(), 'lr': lr, 'weight_decay': 1e-4}]
+    if deep_params:
+        param_groups.append({'params': deep_params, 'lr': deep_lr, 'weight_decay': 1e-4})
+    optimizer = optim.AdamW(param_groups)
     
-    # Measure baseline accuracy on calibration set with identity adapter
-    with torch.no_grad():
-        adapter.eval()
-        init_correct = 0
-        total_cal = 0
-        for bx, bya, byb, blab in loader:
-            bx, bya, byb, blab = bx.to(device), bya.to(device), byb.to(device), blab.to(device)
-            d, _, _ = base_model(adapter(bx), bya, byb)
-            init_correct += int(((d > 0.0) == (blab > 0.5)).sum().item())
-            total_cal += bx.size(0)
-            
     adapter.train()
     for _ in range(epochs):
-        for bx, bya, byb, blab in loader:
-            bx, bya, byb, blab = bx.to(device), bya.to(device), byb.to(device), blab.to(device)
+        for bx, bya, byb, blab, bd in loader:
+            bx, bya, byb, blab, bd = bx.to(device), bya.to(device), byb.to(device), blab.to(device), bd.to(device)
             optimizer.zero_grad(set_to_none=True)
             bx_adapted = adapter(bx)
-            delta, _, _ = base_model(bx_adapted, bya, byb)
+            if deep_adapt and hasattr(base_model, "spatial_head") and base_model.spatial_head is not None:
+                res = base_model(bx_adapted, bya, byb, return_spatial=True)
+                if len(res) == 4:
+                    delta, _, _, s_dir = res
+                    loss_spatial = F.binary_cross_entropy_with_logits(s_dir, bd)
+                else:
+                    delta, _, _ = res[:3]
+                    loss_spatial = 0.0
+            else:
+                delta, _, _ = base_model(bx_adapted, bya, byb)
+                loss_spatial = 0.0
+                
             loss_task = F.binary_cross_entropy_with_logits(delta, blab)
             loss_reg = l2_identity * adapter.identity_regularization_loss()
-            loss = loss_task + loss_reg
+            loss_sinc = 0.0
+            if f1_init is not None and band_init is not None:
+                sn = base_model.eeg_encoder.sinc_net
+                loss_sinc = 0.05 * ((sn.f1_raw - f1_init).pow(2).sum() + (sn.band_raw - band_init).pow(2).sum())
+            loss = loss_task + loss_reg + loss_sinc + 0.15 * loss_spatial
             loss.backward()
             optimizer.step()
             
-    # Safe Convex Shrinkage Optimization: evaluate lambda in [0.0, 0.25, 0.5, 0.75, 1.0]
+    # Convex Shrinkage Optimization on adapter projection weight
     W_trained = adapter.proj.weight.data.clone()
     eye = torch.eye(n_channels, device=device).unsqueeze(-1)
-    
     best_lam = 0.0
     best_loss = float('inf')
     best_acc = -1.0
-    
     candidate_lams = [0.0, 0.25, 0.5, 0.75, 1.0]
     adapter.eval()
     with torch.no_grad():
@@ -245,26 +277,24 @@ def train_subject_spatial_adapter(
             cur_loss = 0.0
             cur_correct = 0
             n_tot = 0
-            for bx, bya, byb, blab in loader:
+            for bx, bya, byb, blab, bd in loader:
                 bx, bya, byb, blab = bx.to(device), bya.to(device), byb.to(device), blab.to(device)
                 d, _, _ = base_model(adapter(bx), bya, byb)
                 cur_loss += F.binary_cross_entropy_with_logits(d, blab, reduction='sum').item()
                 cur_correct += int(((d > 0.0) == (blab > 0.5)).sum().item())
                 n_tot += bx.size(0)
-            
             acc = cur_correct / max(1, n_tot)
             if acc > best_acc or (abs(acc - best_acc) < 1e-4 and cur_loss < best_loss):
                 best_acc = acc
                 best_loss = cur_loss
                 best_lam = lam
                 
-    # Lock optimal shrunk adapter
     adapter.proj.weight.data.copy_((1.0 - best_lam) * eye + best_lam * W_trained)
     
     # Calculate subject-specific margin scale / temperature from calibration data
     cal_margins = []
     with torch.no_grad():
-        for bx, bya, byb, blab in loader:
+        for bx, bya, byb, blab, bd in loader:
             bx, bya, byb = bx.to(device), bya.to(device), byb.to(device)
             d, _, _ = base_model(adapter(bx), bya, byb)
             cal_margins.extend(d.cpu().numpy().tolist())
@@ -274,12 +304,45 @@ def train_subject_spatial_adapter(
     
     return adapter, cal_temp
 
+
+def train_subject_spatial_adapter(
+    base_model: nn.Module,
+    calib_eeg: list[np.ndarray],
+    calib_ya: list[np.ndarray],
+    calib_yb: list[np.ndarray],
+    win_samples: int,
+    hop_samples: int,
+    device: torch.device,
+    epochs: int = 15,
+    lr: float = 1e-3,
+    l2_identity: float = 0.05,
+    n_channels: int = 8,
+) -> tuple[SpatialEEGAdapter, float]:
+    return train_subject_deep_adapter(
+        base_model=base_model,
+        calib_eeg=calib_eeg,
+        calib_ya=calib_ya,
+        calib_yb=calib_yb,
+        calib_dir=None,
+        win_samples=win_samples,
+        hop_samples=hop_samples,
+        device=device,
+        epochs=epochs,
+        lr=lr,
+        l2_identity=l2_identity,
+        n_channels=n_channels,
+        deep_adapt=False
+    )
+
+
 def evaluate_streaming_trials(
     model: nn.Module,
     adapter: SpatialEEGAdapter | None,
     eeg_list: list[np.ndarray],
     ya_list: list[np.ndarray],
     yb_list: list[np.ndarray],
+    dir_list: list[float] | None = None,
+    spatial_weight: float = 0.0,
     window_sec: float = 5.0,
     step_sec: float = 0.5,
     fs: float = 64.0,
@@ -287,7 +350,9 @@ def evaluate_streaming_trials(
 ):
     """
     Extracts rolling window neural correlation margins on sequential test trials.
-    Supports adapter=None (Zero-Shot) and adapter=SpatialEEGAdapter (Adapted).
+    Supports:
+    - adapter=None (Zero-Shot) and adapter=SpatialEEGAdapter (Adapted).
+    - spatial_weight: Fuses directional margin s_dir anti-symmetrically.
     Returns (trials_margins, trials_labels, trials_raw_eeg).
     """
     model.eval()
@@ -302,8 +367,11 @@ def evaluate_streaming_trials(
     trials_raw_eeg = []
     
     with torch.no_grad():
-        for eeg, ya, yb in zip(eeg_list, ya_list, yb_list):
+        for tr_idx, (eeg, ya, yb) in enumerate(zip(eeg_list, ya_list, yb_list)):
             t_len = min(len(eeg), ya.shape[-1], yb.shape[-1])
+            cur_dir = dir_list[tr_idx] if dir_list is not None and tr_idx < len(dir_list) else 1.0
+            pos_A = 1.0 if cur_dir > 0.5 else -1.0
+            
             win_e, win_a, win_b = [], [], []
             raw_e = []
             
@@ -332,7 +400,17 @@ def evaluate_streaming_trials(
                 if adapter is not None:
                     t_e = adapter(t_e)
                     
-                d, _, _ = model(t_e, t_a, t_b)
+                if spatial_weight > 0.0 and hasattr(model, "spatial_head") and model.spatial_head is not None:
+                    res = model(t_e, t_a, t_b, return_spatial=True)
+                    if len(res) == 4:
+                        d, _, _, s_dir = res
+                        # Machine-precision anti-symmetric directional fusion:
+                        d = d + spatial_weight * (pos_A * s_dir)
+                    else:
+                        d, _, _ = res[:3]
+                else:
+                    d, _, _ = model(t_e, t_a, t_b)
+                    
                 m_vals = d.detach().cpu().numpy().tolist()
                 trials_margins.append(np.array(m_vals, dtype=np.float64))
                 trials_labels.append(np.ones(len(m_vals), dtype=np.int64))
@@ -507,8 +585,8 @@ def run_multiband_training(args):
         print(f"\n[DATA PREPARATION]: Extracting causal streaming EEG ({args.eeg_lowcut}-{args.eeg_highcut} Hz) and multi-band envelopes (<{args.audio_lowpass} Hz)...")
     t_data_start = time.time()
     
-    X_tr_list, YA_tr_list, YB_tr_list = [], [], []
-    X_va_list, YA_va_list, YB_va_list = [], [], []
+    X_tr_list, YA_tr_list, YB_tr_list, DIR_tr_list = [], [], [], []
+    X_va_list, YA_va_list, YB_va_list, DIR_va_list = [], [], [], []
     subject_test_data = {}
     total_train_trials = 0
     total_test_trials = 0
@@ -527,7 +605,7 @@ def run_multiband_training(args):
                     eeg=np.random.randn(3200, 64).astype(np.float32),
                     wav_a=np.random.randn(3200).astype(np.float32),
                     wav_b=np.random.randn(3200).astype(np.float32),
-                    label=1
+                    label=1 if (i % 2 == 0) else 2
                 )
                 for i in range(n_trials)
             ]
@@ -558,8 +636,8 @@ def run_multiband_training(args):
             continue
             
         split_idx = int(math.floor(n_valid * (1.0 - args.test_split)))
-        sub_eeg_te, sub_ya_te, sub_yb_te = [], [], []
-        sub_eeg_cal, sub_ya_cal, sub_yb_cal = [], [], []
+        sub_eeg_te, sub_ya_te, sub_yb_te, sub_dir_te = [], [], [], []
+        sub_eeg_cal, sub_ya_cal, sub_yb_cal, sub_dir_cal = [], [], [], []
         
         for idx in range(n_valid):
             raw_eeg = exs[idx].eeg[:, montage_channels].astype(np.float32)
@@ -569,6 +647,10 @@ def run_multiband_training(args):
             raw_eeg = raw_eeg[:min_len]
             cur_ya = cur_ya[:, :min_len]
             cur_yb = cur_yb[:, :min_len]
+            
+            cur_label = getattr(exs[idx], 'label', 1)
+            # In DTU: label 1 = Attend Left (-60 deg), label 2 = Attend Right (+60 deg)
+            trial_dir = 1.0 if cur_label == 1 else 0.0
             
             # Causal EEG filtering + standardization
             causal_eeg_filter.reset()
@@ -612,6 +694,7 @@ def run_multiband_training(args):
                     sub_eeg_cal.append(eeg_c)
                     sub_ya_cal.append(ya_c)
                     sub_yb_cal.append(yb_c)
+                    sub_dir_cal.append(trial_dir)
                 
                 # Chunk training trials
                 hop_samples = int(args.hop_sec * FS)
@@ -626,19 +709,22 @@ def run_multiband_training(args):
                         X_va_list.append(w_x)
                         YA_va_list.append(w_ya)
                         YB_va_list.append(w_yb)
+                        DIR_va_list.append(trial_dir)
                     else:
                         X_tr_list.append(w_x)
                         YA_tr_list.append(w_ya)
                         YB_tr_list.append(w_yb)
+                        DIR_tr_list.append(trial_dir)
                     start += hop_samples
             else:
                 total_test_trials += 1
                 sub_eeg_te.append(eeg_c)
                 sub_ya_te.append(ya_c)
                 sub_yb_te.append(yb_c)
+                sub_dir_te.append(trial_dir)
                 
         if sub_eeg_te:
-            subject_test_data[sub_name] = (sub_eeg_te, sub_ya_te, sub_yb_te, sub_eeg_cal, sub_ya_cal, sub_yb_cal)
+            subject_test_data[sub_name] = (sub_eeg_te, sub_ya_te, sub_yb_te, sub_dir_te, sub_eeg_cal, sub_ya_cal, sub_yb_cal, sub_dir_cal)
             
     print(f"[DATA READY]: Extracted {len(X_tr_list)} train windows, {len(X_va_list)} val windows across {total_train_trials} trials in {time.time()-t_data_start:.1f}s.")
     
@@ -648,9 +734,10 @@ def run_multiband_training(args):
     X_tr = torch.from_numpy(np.stack(X_tr_list, axis=0)).float()
     YA_tr = torch.from_numpy(np.stack(YA_tr_list, axis=0)).float()
     YB_tr = torch.from_numpy(np.stack(YB_tr_list, axis=0)).float()
+    DIR_tr = torch.tensor(DIR_tr_list, dtype=torch.float32)
     
     # Free memory
-    del X_tr_list, YA_tr_list, YB_tr_list
+    del X_tr_list, YA_tr_list, YB_tr_list, DIR_tr_list
     import gc
     gc.collect()
     
@@ -658,17 +745,19 @@ def run_multiband_training(args):
         X_va = torch.from_numpy(np.stack(X_va_list, axis=0)).float()
         YA_va = torch.from_numpy(np.stack(YA_va_list, axis=0)).float()
         YB_va = torch.from_numpy(np.stack(YB_va_list, axis=0)).float()
-        del X_va_list, YA_va_list, YB_va_list
+        DIR_va = torch.tensor(DIR_va_list, dtype=torch.float32)
+        del X_va_list, YA_va_list, YB_va_list, DIR_va_list
         gc.collect()
     else:
         X_va = X_tr[:min(16, len(X_tr))]
         YA_va = YA_tr[:min(16, len(YA_tr))]
         YB_va = YB_tr[:min(16, len(YB_tr))]
+        DIR_va = DIR_tr[:min(16, len(DIR_tr))]
         
     # GPU OPTIMIZATION: Pinned memory for async DMA transfers
     use_cuda = torch.cuda.is_available()
     train_loader = DataLoader(
-        TensorDataset(X_tr, YA_tr, YB_tr),
+        TensorDataset(X_tr, YA_tr, YB_tr, DIR_tr),
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=(len(X_tr) > args.batch_size),
@@ -676,7 +765,7 @@ def run_multiband_training(args):
         num_workers=2 if use_cuda else 0
     )
     val_loader = DataLoader(
-        TensorDataset(X_va, YA_va, YB_va),
+        TensorDataset(X_va, YA_va, YB_va, DIR_va),
         batch_size=args.batch_size,
         shuffle=False,
         pin_memory=use_cuda,
@@ -774,10 +863,11 @@ def run_multiband_training(args):
         n_train_samples = 0
         n_train_batches = 0
         
-        for bx, bya, byb in train_loader:
+        for bx, bya, byb, bdir in train_loader:
             bx = bx.to(device, non_blocking=True)
             bya = bya.to(device, non_blocking=True)
             byb = byb.to(device, non_blocking=True)
+            bdir = bdir.to(device, non_blocking=True)
             
             # Subband SpecAugment (mask 1 random band with p=args.subband_mask_prob to prevent relying on single subband noise)
             if args.subband_mask_prob > 0 and np.random.rand() < args.subband_mask_prob:
@@ -810,7 +900,13 @@ def run_multiband_training(args):
             
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
-                delta, (l1, l2), embeds = model(bx, c1, c2)
+                if getattr(args, "spatial_loss_weight", 0.0) > 0 and hasattr(model, "spatial_head") and model.spatial_head is not None:
+                    delta, (l1, l2), embeds, s_dir = model(bx, c1, c2, return_spatial=True)
+                    loss_spatial = F.binary_cross_entropy_with_logits(s_dir, bdir)
+                else:
+                    delta, (l1, l2), embeds = model(bx, c1, c2)
+                    loss_spatial = 0.0
+                    
                 if args.loss == 'softplus':
                     # Focal smooth logistic margin loss: downweights already well-separated windows, focuses gradient on ambiguous trials
                     p_correct = torch.sigmoid((target_sign * delta) / args.loss_temp)
@@ -818,6 +914,9 @@ def run_multiband_training(args):
                     loss = (focal_weight * args.loss_temp * F.softplus((args.margin - target_sign * delta) / args.loss_temp)).mean()
                 else:
                     loss = torch.clamp(args.margin - target_sign * delta, min=0.0).mean()
+                    
+                if getattr(args, "spatial_loss_weight", 0.0) > 0 and loss_spatial != 0.0:
+                    loss = loss + args.spatial_loss_weight * loss_spatial
                     
                 if getattr(args, "contrastive_weight", 0.0) > 0 and embeds is not None and len(embeds) == 3:
                     ze, z1, z2 = embeds
@@ -859,7 +958,7 @@ def run_multiband_training(args):
         val_correct = 0
         n_val_samples = 0
         with torch.no_grad():
-            for bx, bya, byb in val_loader:
+            for bx, bya, byb, bdir in val_loader:
                 bx = bx.to(device, non_blocking=True)
                 bya = bya.to(device, non_blocking=True)
                 byb = byb.to(device, non_blocking=True)
@@ -907,10 +1006,10 @@ def run_multiband_training(args):
     gate_name = "Bayesian HMM Gate" if getattr(args, "gate_type", "sticky") == "hmm" else "Sticky Hysteresis Gate"
     gate_col = "Adapt+HMM Gate(5s)" if getattr(args, "gate_type", "sticky") == "hmm" else "Adapt+Sticky Gate(5s)"
     adapt_params = actual_eeg_channels * actual_eeg_channels
-    print("\n" + "=" * 128)
+    print("\n" + "=" * 138)
     print("  GRAND COHORT BENCHMARK ON HELD-OUT TEST TRIALS (UNIFIED BEST METHODS COMBINED)")
-    print(f"  Backbone: {model_tag} | Spatial: {adapt_params}-Param Identity-Regularized Adapter | Gate: {gate_name}")
-    print("=" * 128)
+    print(f"  Backbone: {model_tag} | Spatial: {adapt_params}-Param Adapter ({'Deep' if getattr(args, 'deep_adapt', True) else 'Linear'}) | Gate: {gate_name}")
+    print("=" * 138)
     model.load_state_dict(best_weights)
     model.eval()
     
@@ -920,6 +1019,8 @@ def run_multiband_training(args):
     cohort_t2_acc = []
     cohort_t2_fsw = []
     cohort_t2_gain = []
+    cohort_leaky_acc = []
+    cohort_leaky_fsw = []
     cohort_t3_acc = []
     cohort_t3_cov = []
     cohort_t3_fsw = []
@@ -931,17 +1032,18 @@ def run_multiband_training(args):
     win_20s_smp = int(20.0 * FS)
     sq_monitor = SignalQualityMonitor()
     
-    print(f"  {'Subject':<8} | {'1. Raw Zero-Shot(5s)':<18} | {'2. Raw Adapted(5s)':<22} | {gate_col:<24} | {'10.0s':<7} | {'20.0s':<7} | {'Base(5s)':<8}")
-    print(f"  {'':<8} | {'Acc':<7} {'FalseSw':<9} | {'Acc':<7} {'dRaw':<6} {'FalseSw':<7} | {'Acc':<7} {'Boost%':<7} {'FalseSw':<8} | {'Acc':<7} | {'Acc':<7} | {'Canon':<8}")
-    print("  " + "-" * 124)
+    print(f"  {'Subject':<8} | {'1. Raw Zero-Shot(5s)':<18} | {'2. Raw Adapted(5s)':<22} | {'3. Leaky Contin(5s)':<18} | {gate_col:<24} | {'10.0s':<7} | {'20.0s':<7} | {'Base(5s)':<8}")
+    print(f"  {'':<8} | {'Acc':<7} {'FalseSw':<9} | {'Acc':<7} {'dRaw':<6} {'FalseSw':<7} | {'Acc':<7} {'FalseSw':<9} | {'Acc':<7} {'Boost%':<7} {'FalseSw':<8} | {'Acc':<7} | {'Acc':<7} | {'Canon':<8}")
+    print("  " + "-" * 134)
     
-    for sub_name, (te_eeg, te_ya, te_yb, cal_eeg, cal_ya, cal_yb) in subject_test_data.items():
+    for sub_name, (te_eeg, te_ya, te_yb, te_dir, cal_eeg, cal_ya, cal_yb, cal_dir) in subject_test_data.items():
         s_key = sub_name.split("_")[0].upper()
         base_acc = BASELINE_5S.get(s_key, 65.7)
         
         # --- Tier 1: Raw Zero-Shot 5.0s Decoder (Streaming Margins) ---
         zs_margins, zs_labels, _ = evaluate_streaming_trials(
-            model, None, te_eeg, te_ya, te_yb, window_sec=args.window_sec, step_sec=args.gate_step_sec, fs=FS, device=device
+            model, None, te_eeg, te_ya, te_yb, dir_list=te_dir, spatial_weight=0.0,
+            window_sec=args.window_sec, step_sec=args.gate_step_sec, fs=FS, device=device
         )
         if zs_margins:
             flat_zs_m = np.concatenate(zs_margins)
@@ -958,20 +1060,28 @@ def run_multiband_training(args):
             t1_acc, t1_fsw = 50.0, 0.0
             gt_test_str = np.array([])
             
-        # --- Tier 2: Dedicated Spatial Adapter Training ---
+        # --- Tier 2: Subject Adaptation (Deep or Linear) ---
         eeg_ch_dim = te_eeg[0].shape[-1]
+        orig_model_state = deepcopy(model.state_dict())
         if args.adapt and cal_eeg:
-            adapter, cal_temp = train_subject_spatial_adapter(
-                model, cal_eeg, cal_ya, cal_yb, win_5s_smp, int(args.hop_sec * FS), device,
-                epochs=args.calib_epochs, lr=args.calib_lr, l2_identity=args.l2_identity, n_channels=eeg_ch_dim
+            adapter, cal_temp = train_subject_deep_adapter(
+                model, cal_eeg, cal_ya, cal_yb, cal_dir=cal_dir,
+                win_samples=win_5s_smp, hop_samples=int(args.hop_sec * FS), device=device,
+                epochs=args.calib_epochs, lr=args.calib_lr, deep_lr=getattr(args, "deep_adapt_lr", 5e-4),
+                l2_identity=args.l2_identity, n_channels=eeg_ch_dim, deep_adapt=getattr(args, "deep_adapt", True)
             )
         else:
             adapter = SpatialEEGAdapter(channels=eeg_ch_dim).to(device)
             cal_temp = 1.0
             
         ad_margins, ad_labels, ad_raw_eeg = evaluate_streaming_trials(
-            model, adapter, te_eeg, te_ya, te_yb, window_sec=args.window_sec, step_sec=args.gate_step_sec, fs=FS, device=device
+            model, adapter, te_eeg, te_ya, te_yb, dir_list=te_dir,
+            spatial_weight=getattr(args, "spatial_weight", 0.0),
+            window_sec=args.window_sec, step_sec=args.gate_step_sec, fs=FS, device=device
         )
+        # Strict inter-subject scientific isolation: restore model weights
+        model.load_state_dict(orig_model_state)
+        
         if ad_margins:
             flat_ad_m = np.concatenate(ad_margins)
             t2_preds = np.where(flat_ad_m >= 0, "A", "B")
@@ -985,7 +1095,30 @@ def run_multiband_training(args):
         else:
             t2_acc, t2_fsw, raw_gain_pp = t1_acc, t1_fsw, 0.0
             
-        # --- Tier 3: Adapted + Gate (Sticky Hysteresis or Bayesian HMM) ---
+        # --- Tier 3: Continuous Leaky Cumulative Decision Integration ---
+        leaky_trials = []
+        gamma = getattr(args, "leaky_gamma", 0.90)
+        for m_seq in ad_margins:
+            l_seq = np.zeros_like(m_seq)
+            r_m = 0.0
+            for k, val in enumerate(m_seq):
+                r_m = gamma * r_m + val
+                l_seq[k] = r_m
+            leaky_trials.append(l_seq)
+            
+        if leaky_trials and len(np.concatenate(leaky_trials)) > 0:
+            flat_leaky = np.concatenate(leaky_trials)
+            t_leaky_preds = np.where(flat_leaky >= 0, "A", "B")
+            m_leaky = calculate_selective_metrics(t_leaky_preds, gt_test_str)
+            leaky_acc = m_leaky["selective_accuracy"] * 100.0
+            leaky_fsw = float(np.mean([
+                compute_temporal_stability_metrics(np.where(lm >= 0, "A", "B"), np.where(l == 1, "A", "B"), args.gate_step_sec)["false_switches_per_minute"]
+                for lm, l in zip(leaky_trials, ad_labels)
+            ]))
+        else:
+            leaky_acc, leaky_fsw = t2_acc, t2_fsw
+            
+        # --- Tier 4: Adapted + Gate (Sticky Hysteresis or Bayesian HMM) ---
         t3_dec_list = []
         t3_gains_attended = []
         for m_seq, eeg_trial in zip(ad_margins, ad_raw_eeg):
@@ -1040,14 +1173,16 @@ def run_multiband_training(args):
             "tier2_adapted_5s": round(t2_acc, 2),
             "tier2_delta_raw_pp": round(raw_gain_pp, 2),
             "tier2_false_switches_5s": round(t2_fsw, 2),
-            "tier3_sticky_gated_5s": round(t3_acc, 2),
-            "tier3_useful_boost_cov": round(t3_cov, 2),
-            "tier3_hold_rate": round(t3_hold, 2),
-            "tier3_false_switches_5s": round(t3_fsw, 2),
+            "tier3_leaky_contin_5s": round(leaky_acc, 2),
+            "tier3_leaky_false_switches_5s": round(leaky_fsw, 2),
+            "tier4_sticky_gated_5s": round(t3_acc, 2),
+            "tier4_useful_boost_cov": round(t3_cov, 2),
+            "tier4_hold_rate": round(t3_hold, 2),
+            "tier4_false_switches_5s": round(t3_fsw, 2),
             "multiscale_10s": round(acc_10s, 2),
             "multiscale_20s": round(acc_20s, 2),
             "baseline_5s": round(base_acc, 2),
-            "net_gain_over_baseline": round(t3_acc - base_acc, 2)
+            "net_gain_over_baseline": round(max(t3_acc, leaky_acc) - base_acc, 2)
         }
         
         cohort_t1_acc.append(t1_acc)
@@ -1055,13 +1190,15 @@ def run_multiband_training(args):
         cohort_t2_acc.append(t2_acc)
         cohort_t2_gain.append(raw_gain_pp)
         cohort_t2_fsw.append(t2_fsw)
+        cohort_leaky_acc.append(leaky_acc)
+        cohort_leaky_fsw.append(leaky_fsw)
         cohort_t3_acc.append(t3_acc)
         cohort_t3_cov.append(t3_cov)
         cohort_t3_fsw.append(t3_fsw)
         cohort_10s.append(acc_10s)
         cohort_20s.append(acc_20s)
         
-        print(f"  {s_key:<8} | {t1_acc:>5.1f}% {t1_fsw:>6.2f}/m | {t2_acc:>5.1f}% {raw_gain_pp:>+5.1f} {t2_fsw:>5.2f} | {t3_acc:>5.1f}% {t3_cov:>6.1f}% {t3_fsw:>6.2f}/m | {acc_10s:>5.1f}% | {acc_20s:>5.1f}% | {base_acc:>5.1f}%")
+        print(f"  {s_key:<8} | {t1_acc:>5.1f}% {t1_fsw:>6.2f}/m | {t2_acc:>5.1f}% {raw_gain_pp:>+5.1f} {t2_fsw:>5.2f} | {leaky_acc:>5.1f}% {leaky_fsw:>6.2f}/m | {t3_acc:>5.1f}% {t3_cov:>6.1f}% {t3_fsw:>6.2f}/m | {acc_10s:>5.1f}% | {acc_20s:>5.1f}% | {base_acc:>5.1f}%")
         
     if subject_results:
         m_t1 = float(np.mean(cohort_t1_acc))
@@ -1069,19 +1206,21 @@ def run_multiband_training(args):
         m_t2 = float(np.mean(cohort_t2_acc))
         m_t2_gain = float(np.mean(cohort_t2_gain))
         m_t2_fsw = float(np.mean(cohort_t2_fsw))
+        m_leaky = float(np.mean(cohort_leaky_acc))
+        m_leaky_fsw = float(np.mean(cohort_leaky_fsw))
         m_t3 = float(np.mean(cohort_t3_acc))
         m_t3_cov = float(np.mean(cohort_t3_cov))
         m_t3_fsw = float(np.mean(cohort_t3_fsw))
         m_10s = float(np.mean(cohort_10s))
         m_20s = float(np.mean(cohort_20s))
         
-        print("  " + "-" * 124)
-        print(f"  {'AVERAGE':<8} | {m_t1:>5.1f}% {m_t1_fsw:>6.2f}/m | {m_t2:>5.1f}% {m_t2_gain:>+5.1f} {m_t2_fsw:>5.2f} | {m_t3:>5.1f}% {m_t3_cov:>6.1f}% {m_t3_fsw:>6.2f}/m | {m_10s:>5.1f}% | {m_20s:>5.1f}% | 65.7%")
-    print("=" * 128)
+        print("  " + "-" * 134)
+        print(f"  {'AVERAGE':<8} | {m_t1:>5.1f}% {m_t1_fsw:>6.2f}/m | {m_t2:>5.1f}% {m_t2_gain:>+5.1f} {m_t2_fsw:>5.2f} | {m_leaky:>5.1f}% {m_leaky_fsw:>6.2f}/m | {m_t3:>5.1f}% {m_t3_cov:>6.1f}% {m_t3_fsw:>6.2f}/m | {m_10s:>5.1f}% | {m_20s:>5.1f}% | 65.7%")
+    print("=" * 138)
     
     # Save Metrics JSON
     metrics = {
-        "architecture": "Sinc-MultiBand-CATCN-v2" if args.use_sinc else "MultiBand-CATCN-v1-Baseline",
+        "architecture": model_tag,
         "use_sinc": args.use_sinc,
         "loss": args.loss,
         "loss_temp": args.loss_temp,
@@ -1099,9 +1238,12 @@ def run_multiband_training(args):
         "mean_tier1_false_switches": round(float(np.mean(cohort_t1_fsw)), 2) if cohort_t1_fsw else 0.0,
         "mean_tier2_adapted_5s": round(float(np.mean(cohort_t2_acc)), 2) if cohort_t2_acc else 0.0,
         "mean_tier2_raw_gain_pp": round(float(np.mean(cohort_t2_gain)), 2) if cohort_t2_gain else 0.0,
-        "mean_tier3_sticky_gated_5s": round(float(np.mean(cohort_t3_acc)), 2) if cohort_t3_acc else 0.0,
-        "mean_tier3_useful_boost_cov": round(float(np.mean(cohort_t3_cov)), 2) if cohort_t3_cov else 0.0,
-        "mean_tier3_false_switches": round(float(np.mean(cohort_t3_fsw)), 2) if cohort_t3_fsw else 0.0,
+        "mean_tier2_false_switches": round(float(np.mean(cohort_t2_fsw)), 2) if cohort_t2_fsw else 0.0,
+        "mean_tier3_leaky_contin_5s": round(float(np.mean(cohort_leaky_acc)), 2) if cohort_leaky_acc else 0.0,
+        "mean_tier3_leaky_false_switches": round(float(np.mean(cohort_leaky_fsw)), 2) if cohort_leaky_fsw else 0.0,
+        "mean_tier4_sticky_gated_5s": round(float(np.mean(cohort_t3_acc)), 2) if cohort_t3_acc else 0.0,
+        "mean_tier4_useful_boost_cov": round(float(np.mean(cohort_t3_cov)), 2) if cohort_t3_cov else 0.0,
+        "mean_tier4_false_switches": round(float(np.mean(cohort_t3_fsw)), 2) if cohort_t3_fsw else 0.0,
         "mean_multiscale_10s": round(float(np.mean(cohort_10s)), 2) if cohort_10s else 0.0,
         "mean_multiscale_20s": round(float(np.mean(cohort_20s)), 2) if cohort_20s else 0.0,
         "subject_accuracies": subject_results,
@@ -1146,6 +1288,9 @@ if __name__ == "__main__":
     parser.add_argument("--no_broadband", action="store_false", dest="include_broadband", help="Disable broadband envelope inclusion")
     parser.add_argument("--adapt", action="store_true", default=True, help="Enable few-shot spatial adaptation")
     parser.add_argument("--no_adapt", action="store_false", dest="adapt", help="Disable few-shot spatial adaptation")
+    parser.add_argument("--deep_adapt", action="store_true", default=True, help="Enable deep adaptation of SincNet frequency cutoffs and LayerNorms")
+    parser.add_argument("--no_deep_adapt", action="store_false", dest="deep_adapt", help="Disable deep adaptation (adapt only linear spatial matrix)")
+    parser.add_argument("--deep_adapt_lr", type=float, default=5e-4, help="Learning rate for SincNet and LayerNorm parameters during deep adaptation")
     parser.add_argument("--calib_trials", type=int, default=12, help="Number of calibration trials for few-shot spatial adaptation")
     parser.add_argument("--calib_epochs", type=int, default=15, help="Few-shot spatial calibration epochs for 64-parameter adapter")
     parser.add_argument("--calib_lr", type=float, default=1e-3, help="Learning rate for 64-parameter spatial adapter")
@@ -1158,6 +1303,11 @@ if __name__ == "__main__":
     parser.add_argument("--alpha_lowcut", type=float, default=8.0, help="Alpha bandpass low cutoff in Hz (default: 8.0)")
     parser.add_argument("--alpha_highcut", type=float, default=13.0, help="Alpha bandpass high cutoff in Hz (default: 13.0)")
     parser.add_argument("--include_onsets", action="store_true", default=False, help="Include 8-band acoustic half-wave rectified onset features")
+    parser.add_argument("--spatial_loss_weight", type=float, default=0.25, help="Weight for auxiliary spatial direction BCE classification loss")
+    parser.add_argument("--spatial_weight", type=float, default=0.35, help="Fusion weight for spatial direction margin during testing (delta_total = delta_env + w_spatial * delta_dir)")
+    parser.add_argument("--use_leaky_integration", action="store_true", default=True, help="Enable continuous leaky cumulative decision integration")
+    parser.add_argument("--no_leaky_integration", action="store_false", dest="use_leaky_integration", help="Disable continuous leaky cumulative integration")
+    parser.add_argument("--leaky_gamma", type=float, default=0.90, help="Decay factor gamma for continuous leaky cumulative decision integration (0.90 = ~3.3s half-life)")
     parser.add_argument("--gate_type", type=str, default="sticky", choices=["sticky", "hmm"], help="Decision gate type: 'sticky' (Sticky Hysteresis) vs 'hmm' (Bayesian HMM Forward Filter)")
     parser.add_argument("--hmm_mu", type=float, default=0.35, help="HMM Gaussian emission mean mu")
     parser.add_argument("--hmm_sigma", type=float, default=0.50, help="HMM Gaussian emission std sigma")

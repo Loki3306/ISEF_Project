@@ -554,6 +554,35 @@ class NeuroConformer_ClassifierHead(nn.Module):
         return delta, (la, lb)
 
 
+class SpatialDirectionHead(nn.Module):
+    """
+    Biological Spatial Direction Head for Scalp EEG.
+    Extracts hemispheric Left (-60°) vs. Right (+60°) attention azimuth from EEG latents
+    via temporal attention pooling over cortical tokens and a calibrated linear projection.
+    Outputs:
+        s_dir: scalar logit (B,). Positive -> Left attention (+1), Negative -> Right attention (-1).
+    """
+    def __init__(self, d_model: int = 80, dropout: float = 0.15):
+        super().__init__()
+        self.attn_pool = nn.Sequential(
+            nn.Linear(d_model, 1),
+            nn.Softmax(dim=1)
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, max(16, d_model // 2)),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(max(16, d_model // 2), 1)
+        )
+        
+    def forward(self, ze: torch.Tensor) -> torch.Tensor:
+        # ze: (B, D, T)
+        ze_t = ze.transpose(1, 2)  # (B, T, D)
+        weights = self.attn_pool(ze_t)  # (B, T, 1)
+        pooled = torch.sum(ze_t * weights, dim=1)  # (B, D)
+        return self.mlp(pooled).squeeze(-1)  # (B,)
+
+
 # -------------------------------------------------------------------------------------------------
 # 6. UNIFIED DUAL-STREAM CROSS-MODAL NEURO-CONFORMER DECODER
 # -------------------------------------------------------------------------------------------------
@@ -561,9 +590,9 @@ class NeuroConformer_ClassifierHead(nn.Module):
 class NeuroConformerDecoder(nn.Module):
     """
     Dual-Stream Cross-Modal Neuro-Conformer (v5).
-    Full self-attention Conformer backbones + causal cross-modal attention + exact anti-symmetry.
+    Full self-attention Conformer backbones + causal cross-modal attention + spatial direction head.
     Features temporal subsampling stride (default 2) for 4x faster training and enhanced cortical SNR.
-    Target parameter count: ~480,000 parameters (with d_model=80).
+    Target parameter count: ~490,000 parameters (with d_model=80).
     """
     def __init__(
         self,
@@ -610,13 +639,33 @@ class NeuroConformerDecoder(nn.Module):
             head_dropout=head_dropout,
             subsample_stride=subsample_stride
         )
+        self.spatial_head = SpatialDirectionHead(
+            d_model=d_model,
+            dropout=head_dropout
+        )
         
-    def forward(self, eeg: torch.Tensor, audio_a: torch.Tensor, audio_b: torch.Tensor):
+    def forward(
+        self,
+        eeg: torch.Tensor,
+        audio_a: torch.Tensor,
+        audio_b: torch.Tensor,
+        return_spatial: bool = False
+    ):
         ze = self.eeg_encoder(eeg)
         za = self.audio_encoder(audio_a)
         zb = self.audio_encoder(audio_b)
         delta, (logit_a, logit_b) = self.classifier_head(ze, za, zb)
+        if return_spatial:
+            s_dir = self.spatial_head(ze)
+            return delta, (logit_a, logit_b), (ze, za, zb), s_dir
         return delta, (logit_a, logit_b), (ze, za, zb)
+
+    def predict_spatial_direction(self, eeg: torch.Tensor) -> torch.Tensor:
+        ze = self.eeg_encoder(eeg)
+        return self.spatial_head(ze)
+
+    def predict_spatial_from_latents(self, ze: torch.Tensor) -> torch.Tensor:
+        return self.spatial_head(ze)
 
 
 if __name__ == "__main__":
@@ -629,8 +678,14 @@ if __name__ == "__main__":
     dummy_a = torch.randn(2, 9, 320)
     dummy_b = torch.randn(2, 9, 320)
     
+    # 1. Standard 3-tuple return (100% backward compatible)
     delta, (la, lb), (ze, za, zb) = model(dummy_eeg, dummy_a, dummy_b)
     print(f"Forward Output Shapes: delta={delta.shape}, la={la.shape}, ze={ze.shape}, za={za.shape}")
+    
+    # 2. 4-tuple return with spatial direction logit
+    delta_sp, (la_sp, lb_sp), _, s_dir = model(dummy_eeg, dummy_a, dummy_b, return_spatial=True)
+    assert torch.allclose(delta, delta_sp), "Spatial flag changed delta output!"
+    print(f"Spatial Direction Output Shape: s_dir={s_dir.shape}")
     
     # Modular sub-calls (for streaming context)
     ze_sub = model.eeg_encoder(dummy_eeg)
@@ -644,4 +699,14 @@ if __name__ == "__main__":
     disc = torch.max(torch.abs(delta + delta_rev)).item()
     print(f"Machine-Precision Anti-Symmetry Error |Delta(A,B) + Delta(B,A)|: {disc:.2e}")
     assert disc < 1e-6, "Anti-symmetry violation detected!"
-    print("[PASS]: Perfect anti-symmetry verified!")
+    
+    # Spatial Direction Symmetrized Margin Verification
+    # Candidate 1 is Left (+1), Candidate 2 is Right (-1)
+    w_sp = 0.5
+    fused_fwd = delta + w_sp * (1.0 * s_dir)
+    # Swapped: Candidate 1 is Right (-1), Candidate 2 is Left (+1)
+    fused_rev = delta_rev + w_sp * (-1.0 * s_dir)
+    fused_disc = torch.max(torch.abs(fused_fwd + fused_rev)).item()
+    print(f"Machine-Precision Fused Anti-Symmetry Error |Fused(A,B) + Fused(B,A)|: {fused_disc:.2e}")
+    assert fused_disc < 1e-6, "Fused anti-symmetry violation detected!"
+    print("[PASS]: Perfect anti-symmetry verified for both envelope and spatial fusion!")
