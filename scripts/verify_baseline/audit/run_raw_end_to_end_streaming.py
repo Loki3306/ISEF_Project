@@ -180,6 +180,8 @@ class StreamingCausalMultiBandGammatoneExtractor:
         self.prev_last_env = decimated_env[:, -1].copy()
         
         diff = np.diff(decimated_env, prepend=prepend, axis=-1)
+        onset = np.maximum(0.0, diff) # [8, target_samples]
+        
         # Prepend broadband envelope (channel 0) to 8 cochlear subbands + 8 acoustic onsets -> 17 channels
         broadband_env = np.mean(decimated_env, axis=0, keepdims=True) # [1, target_samples]
         out_17 = np.concatenate([broadband_env, decimated_env, onset], axis=0) # [17, target_samples]
