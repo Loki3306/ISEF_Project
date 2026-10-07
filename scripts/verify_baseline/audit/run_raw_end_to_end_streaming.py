@@ -153,6 +153,7 @@ def run_raw_end_to_end_streaming(
     simulate_switch: bool = False,
     switch_time_sec: float = 15.0,
     realtime_clock: bool = False,
+    live_audio: bool = False,
     device: torch.device = torch.device("cpu"),
     max_boost_db: float = 6.0,
     max_suppress_db: float = 18.0,
@@ -162,6 +163,7 @@ def run_raw_end_to_end_streaming(
     print("\n" + "=" * 126)
     print(f"  REAL-TIME AUDITORY ATTENTION STREAMING: Subject {subject_id} — Trial {trial_idx}")
     print(f"  Mode: TRUE RAW INGESTION (Raw BioSemi 512 Hz EEG + Raw 44.1 kHz Speech WAVs)")
+    print(f"  Live Audio Playback: {'ENABLED (Streaming to PC Speakers/Headphones)' if live_audio else 'DISABLED (File Render Only)'}")
     print(f"  Window: {WINDOW_SEC}s | Hop/Tick: {CHUNK_SEC*1000:.0f} ms | Leaky Gamma: {leaky_gamma} | Device: {device}")
     print(f"  Acoustic Panning: +{max_boost_db} dB Attended Boost | -{max_suppress_db} dB Suppression | Slew: {tau_ms} ms")
     print("=" * 126)
@@ -322,6 +324,16 @@ def run_raw_end_to_end_streaming(
     sys.stdout.flush()
     
     start_time = time.time()
+    audio_stream = None
+    if live_audio:
+        try:
+            import sounddevice as sd
+            audio_stream = sd.OutputStream(samplerate=FS_AUDIO, channels=2, dtype='float32')
+            audio_stream.start()
+            print("  [LIVE AUDIO]: Hardware output stream opened on Realtek Audio Speakers/Headphones.")
+        except Exception as e:
+            print(f"  [LIVE AUDIO WARNING]: Could not open real-time audio output stream: {e}")
+            audio_stream = None
     
     for tick in range(total_ticks):
         tick_t0 = time.perf_counter()
@@ -434,6 +446,11 @@ def run_raw_end_to_end_streaming(
             steered_audio_chunks.append(stereo_out)
             mixture_audio_chunks.append(mix_stereo)
             
+            # Live soundcard streaming to headphones / speakers
+            if audio_stream is not None:
+                # sounddevice expects [N_samples, 2] interleaved float32
+                audio_stream.write(stereo_out.T.astype(np.float32))
+            
         # Telemetry Recording
         tick_t1 = time.perf_counter()
         lat_ms = (tick_t1 - tick_t0) * 1000.0
@@ -454,11 +471,19 @@ def run_raw_end_to_end_streaming(
         print(f"  {cur_t_sec:5.2f}s  | #{tick:03d}  |   {m_val:+6.3f}    |   {running_leaky:+6.3f}    |  {disp_state:^8}  |  {conf_pct:4.1f}%  | {g_disp:^19} | {lat_ms:5.1f} ms | {meter_str}")
         sys.stdout.flush()
         
-        if realtime_clock:
+        # Wall clock pacing: if live_audio or realtime_clock is active, wait for the 250 ms tick window
+        if realtime_clock or live_audio:
             elapsed = time.perf_counter() - tick_t0
             rem = CHUNK_SEC - elapsed
             if rem > 0:
                 time.sleep(rem)
+                
+    if audio_stream is not None:
+        try:
+            audio_stream.stop()
+            audio_stream.close()
+        except Exception:
+            pass
                 
     # 7. Concatenate and Save Rendered WAV Files
     steered_full = np.concatenate(steered_audio_chunks, axis=1) if steered_audio_chunks else np.zeros((2, 0), dtype=np.float32)
@@ -700,6 +725,7 @@ def main():
     parser.add_argument("--simulate_switch", action="store_true", help="Simulate dynamic attention switch")
     parser.add_argument("--switch_time_sec", type=float, default=15.0, help="Switch timestamp in seconds")
     parser.add_argument("--realtime_clock", action="store_true", help="Throttle execution to 1:1 wall clock real time")
+    parser.add_argument("--live_audio", action="store_true", help="Play steered audio live to your headphones/speakers as each tick runs")
     parser.add_argument("--device", type=str, default="cpu", help="Device (cpu or cuda)")
     
     args = parser.parse_args()
@@ -716,6 +742,7 @@ def main():
         simulate_switch=args.simulate_switch,
         switch_time_sec=args.switch_time_sec,
         realtime_clock=args.realtime_clock,
+        live_audio=args.live_audio,
         device=dev
     )
 
