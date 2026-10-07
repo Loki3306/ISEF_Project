@@ -85,13 +85,33 @@ def evaluate_windows(model, eeg_list, ya_list, yb_list, window_samples, device, 
     """
     total_wins = 0
     correct_wins = 0
-    model.eval()
+    if isinstance(model, (list, tuple)):
+        for m in model:
+            m.eval()
+    else:
+        model.eval()
     if adapter is not None:
         adapter.eval()
     with torch.no_grad():
         for eeg, ya, yb in zip(eeg_list, ya_list, yb_list):
             t_len = min(len(eeg), ya.shape[-1], yb.shape[-1])
-            if streaming_context:
+            if isinstance(model, (list, tuple)):
+                for s in range(0, t_len - window_samples + 1, window_samples):
+                    e = s + window_samples
+                    w_e = torch.from_numpy(eeg[s:e].T.copy()).unsqueeze(0).float().to(device)
+                    w_a = torch.from_numpy(ya[:, s:e].copy()).unsqueeze(0).float().to(device)
+                    w_b = torch.from_numpy(yb[:, s:e].copy()).unsqueeze(0).float().to(device)
+                    if adapter is not None:
+                        w_e = adapter(w_e)
+                    deltas = [m(w_e, w_a, w_b)[0] for m in model]
+                    delta = torch.stack(deltas).mean(dim=0)
+                    val = delta.item()
+                    if abs(val) < 1e-6:
+                        correct_wins += 0.5
+                    elif val > 0.0:
+                        correct_wins += 1.0
+                    total_wins += 1
+            elif streaming_context:
                 full_e = torch.from_numpy(eeg[:t_len].T.copy()).unsqueeze(0).float().to(device)
                 full_a = torch.from_numpy(ya[:, :t_len].copy()).unsqueeze(0).float().to(device)
                 full_b = torch.from_numpy(yb[:, :t_len].copy()).unsqueeze(0).float().to(device)
@@ -355,7 +375,11 @@ def evaluate_streaming_trials(
     - spatial_weight: Fuses directional margin s_dir anti-symmetrically.
     Returns (trials_margins, trials_labels, trials_raw_eeg).
     """
-    model.eval()
+    if isinstance(model, (list, tuple)):
+        for m in model:
+            m.eval()
+    else:
+        model.eval()
     if adapter is not None:
         adapter.eval()
         
@@ -400,7 +424,10 @@ def evaluate_streaming_trials(
                 if adapter is not None:
                     t_e = adapter(t_e)
                     
-                if spatial_weight > 0.0 and hasattr(model, "spatial_head") and model.spatial_head is not None:
+                if isinstance(model, (list, tuple)):
+                    ds = [m(t_e, t_a, t_b)[0] for m in model]
+                    d = torch.stack(ds).mean(dim=0)
+                elif spatial_weight > 0.0 and hasattr(model, "spatial_head") and model.spatial_head is not None:
                     res = model(t_e, t_a, t_b, return_spatial=True)
                     if len(res) == 4:
                         d, _, _, s_dir = res
@@ -1105,6 +1132,35 @@ def run_multiband_training(args):
     model.load_state_dict(best_weights)
     model.eval()
     
+    ensemble_models = []
+    if getattr(args, "ensemble_checkpoints", None):
+        e_paths = [Path(p.strip()) for p in args.ensemble_checkpoints.split(",") if p.strip()]
+        for p in e_paths:
+            if p.exists():
+                m = deepcopy(model)
+                st = torch.load(p, map_location=device, weights_only=False)
+                if "model_state_dict" in st:
+                    st = st["model_state_dict"]
+                if any(k.startswith("model.") for k in st.keys()) and not any(k.startswith("model.") for k in m.state_dict().keys()):
+                    st = {k[6:]: v for k, v in st.items()}
+                elif not any(k.startswith("model.") for k in st.keys()) and any(k.startswith("model.") for k in m.state_dict().keys()):
+                    st = {f"model.{k}": v for k, v in st.items()}
+                try:
+                    m.load_state_dict(st, strict=False)
+                except RuntimeError:
+                    m_state = m.state_dict()
+                    filtered_st = {k: v for k, v in st.items() if k in m_state and v.shape == m_state[k].shape}
+                    m.load_state_dict(filtered_st, strict=False)
+                m.eval()
+                ensemble_models.append(m)
+                print(f"  [ENSEMBLE]: Successfully loaded member checkpoint: {p.name}")
+            else:
+                print(f"  [ENSEMBLE WARNING]: Specified member checkpoint {p} not found on disk.")
+        if ensemble_models:
+            print(f"  [ENSEMBLE ACTIVE]: Averaging predictions across {len(ensemble_models)} checkpoints.")
+            
+    eval_model = ensemble_models if ensemble_models else model
+    
     subject_results = {}
     cohort_t1_acc = []
     cohort_t1_fsw = []
@@ -1134,7 +1190,7 @@ def run_multiband_training(args):
         
         # --- Tier 1: Raw Zero-Shot 5.0s Decoder (Streaming Margins) ---
         zs_margins, zs_labels, _ = evaluate_streaming_trials(
-            model, None, te_eeg, te_ya, te_yb, dir_list=te_dir, spatial_weight=0.0,
+            eval_model, None, te_eeg, te_ya, te_yb, dir_list=te_dir, spatial_weight=0.0,
             window_sec=args.window_sec, step_sec=args.gate_step_sec, fs=FS, device=device
         )
         if zs_margins:
@@ -1154,10 +1210,11 @@ def run_multiband_training(args):
             
         # --- Tier 2: Subject Adaptation (Deep or Linear) ---
         eeg_ch_dim = te_eeg[0].shape[-1]
-        orig_model_state = deepcopy(model.state_dict())
+        adapt_base = ensemble_models[0] if ensemble_models else model
+        orig_model_state = deepcopy(adapt_base.state_dict())
         if args.adapt and cal_eeg:
             adapter, cal_temp = train_subject_deep_adapter(
-                model, cal_eeg, cal_ya, cal_yb, cal_dir=cal_dir,
+                adapt_base, cal_eeg, cal_ya, cal_yb, cal_dir=cal_dir,
                 win_samples=win_5s_smp, hop_samples=int(args.hop_sec * FS), device=device,
                 epochs=args.calib_epochs, lr=args.calib_lr, deep_lr=getattr(args, "deep_adapt_lr", 5e-4),
                 l2_identity=args.l2_identity, n_channels=eeg_ch_dim, deep_adapt=getattr(args, "deep_adapt", False)
@@ -1167,12 +1224,12 @@ def run_multiband_training(args):
             cal_temp = 1.0
             
         ad_margins, ad_labels, ad_raw_eeg = evaluate_streaming_trials(
-            model, adapter, te_eeg, te_ya, te_yb, dir_list=te_dir,
+            eval_model, adapter, te_eeg, te_ya, te_yb, dir_list=te_dir,
             spatial_weight=getattr(args, "spatial_weight", 0.0),
             window_sec=args.window_sec, step_sec=args.gate_step_sec, fs=FS, device=device
         )
         # Strict inter-subject scientific isolation: restore model weights
-        model.load_state_dict(orig_model_state)
+        adapt_base.load_state_dict(orig_model_state)
         
         if ad_margins:
             flat_ad_m = np.concatenate(ad_margins)
@@ -1256,8 +1313,8 @@ def run_multiband_training(args):
             t3_acc, t3_cov, t3_hold, t3_fsw = t2_acc, 0.0, 0.0, t2_fsw
             
         # --- Multi-Scale 10s & 20s Window Accuracies ---
-        acc_10s, _ = evaluate_windows(model, te_eeg, te_ya, te_yb, win_10s_smp, device, adapter=adapter, streaming_context=args.streaming_context)
-        acc_20s, _ = evaluate_windows(model, te_eeg, te_ya, te_yb, win_20s_smp, device, adapter=adapter, streaming_context=args.streaming_context)
+        acc_10s, _ = evaluate_windows(eval_model, te_eeg, te_ya, te_yb, win_10s_smp, device, adapter=adapter, streaming_context=args.streaming_context)
+        acc_20s, _ = evaluate_windows(eval_model, te_eeg, te_ya, te_yb, win_20s_smp, device, adapter=adapter, streaming_context=args.streaming_context)
         
         subject_results[sub_name] = {
             "tier1_zero_shot_5s": round(t1_acc, 2),
@@ -1413,6 +1470,7 @@ if __name__ == "__main__":
     parser.add_argument("--arch", type=str, default="conformer", choices=["conformer", "neuroconformer", "msca", "sinc", "baseline"], help="Model architecture: 'conformer' (v4 Dual-Stream Cross-Modal Neuro-Conformer), 'msca' (v3), 'sinc' (v2), 'baseline' (v1)")
     parser.add_argument("--subsample_stride", type=int, default=2, help="Temporal subsampling stride for Conformer attention (2 = 32Hz, 4x speedup, 1 = unstrided 64Hz)")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Pre-trained checkpoint to load")
+    parser.add_argument("--ensemble_checkpoints", type=str, default=None, help="Comma-separated paths to multiple pre-trained checkpoints to ensemble during evaluation (e.g. ckpt1.pt,ckpt2.pt)")
     parser.add_argument("--eval_only", action="store_true", help="Skip backbone training and execute adaptation and multi-tier benchmark directly")
     parser.add_argument("--streaming_context", action="store_true", help="Enable continuous streaming context for multi-scale 10s and 20s windows")
     parser.add_argument("--output_model", type=str, default="/kaggle/working/sinc_multiband_catcn_best.pt")
