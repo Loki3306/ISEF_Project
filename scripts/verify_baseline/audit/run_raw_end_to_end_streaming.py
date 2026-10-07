@@ -448,8 +448,9 @@ def run_raw_end_to_end_streaming(
             
             # Live soundcard streaming to headphones / speakers
             if audio_stream is not None:
-                # sounddevice expects [N_samples, 2] interleaved float32
-                audio_stream.write(stereo_out.T.astype(np.float32))
+                # sounddevice expects C-contiguous [N_samples, 2] interleaved float32
+                out_block = np.ascontiguousarray(stereo_out.T, dtype=np.float32)
+                audio_stream.write(out_block)
             
         # Telemetry Recording
         tick_t1 = time.perf_counter()
