@@ -14,6 +14,7 @@ import json
 import time
 import math
 import glob
+import random
 from pathlib import Path
 from copy import deepcopy
 import numpy as np
@@ -533,6 +534,14 @@ def run_multiband_training(args):
     montage_channels = MONTAGES[args.montage]
     n_ch = len(montage_channels)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if getattr(args, "seed", None) is not None:
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        np.random.seed(args.seed)
+        random.seed(args.seed)
+        print(f"[REPRODUCIBILITY]: Initialized training with random seed: {args.seed}")
     
     if args.smoke_test:
         args.epochs = 1
@@ -1475,6 +1484,7 @@ if __name__ == "__main__":
     parser.add_argument("--streaming_context", action="store_true", help="Enable continuous streaming context for multi-scale 10s and 20s windows")
     parser.add_argument("--output_model", type=str, default="/kaggle/working/sinc_multiband_catcn_best.pt")
     parser.add_argument("--output_metrics", type=str, default="/kaggle/working/sinc_multiband_catcn_metrics.json")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for model initialization and reproducibility")
     parser.add_argument("--smoke_test", action="store_true", help="Run rapid CPU smoke test")
     parser.add_argument("--subjects", type=str, default=None, help="Comma-separated subjects to run, or 'all'")
     args = parser.parse_args()
