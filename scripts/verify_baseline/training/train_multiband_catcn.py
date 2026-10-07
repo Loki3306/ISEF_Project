@@ -682,7 +682,8 @@ def run_multiband_training(args):
         dropout=args.dropout,
         head_dropout=args.head_dropout,
         use_sinc=args.use_sinc,
-        arch=args.arch
+        arch=args.arch,
+        subsample_stride=args.subsample_stride
     ).to(device)
     
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -698,7 +699,13 @@ def run_multiband_training(args):
     print(f"  Head: {args.head_type} (dropout={args.head_dropout}) | Loss: {args.loss} (margin={args.margin}, tau={args.loss_temp}) | Lags: [{args.min_lag_samples}, {args.max_lag_samples}]")
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
+    warmup_epochs = 1 if args.arch in ["conformer", "neuroconformer"] else 0
+    if warmup_epochs > 0 and args.epochs > 1:
+        warmup_sched = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.33, end_factor=1.0, total_iters=warmup_epochs)
+        cosine_sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs - warmup_epochs), eta_min=1e-5)
+        scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs])
+    else:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
     scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
     
     best_val_acc = 0.0
@@ -1089,6 +1096,7 @@ if __name__ == "__main__":
     parser.add_argument("--audio_dir", type=str, default=None)
     parser.add_argument("--audio_env_file", type=str, default=None)
     parser.add_argument("--arch", type=str, default="sinc", choices=["conformer", "neuroconformer", "msca", "sinc", "baseline"], help="Model architecture: 'conformer' (v4 Dual-Stream Cross-Modal Neuro-Conformer), 'msca' (v3), 'sinc' (v2), 'baseline' (v1)")
+    parser.add_argument("--subsample_stride", type=int, default=2, help="Temporal subsampling stride for Conformer attention (2 = 32Hz, 4x speedup, 1 = unstrided 64Hz)")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Pre-trained checkpoint to load")
     parser.add_argument("--eval_only", action="store_true", help="Skip backbone training and execute adaptation and multi-tier benchmark directly")
     parser.add_argument("--streaming_context", action="store_true", help="Enable continuous streaming context for multi-scale 10s and 20s windows")

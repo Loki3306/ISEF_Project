@@ -610,11 +610,13 @@ class MultiBandCATCNDecoder(nn.Module):
         dropout: float = 0.2,
         head_dropout: float = 0.25,
         use_sinc: bool = True,
-        arch: str = "sinc"
+        arch: str = "sinc",
+        subsample_stride: int = 2
     ):
         super().__init__()
         self.use_sinc = use_sinc
         self.arch = arch
+        self.subsample_stride = subsample_stride
         if arch in ["conformer", "neuroconformer"]:
             d_m = hidden_dim if hidden_dim >= 64 else 80
             self.model = NeuroConformerDecoder(
@@ -627,7 +629,8 @@ class MultiBandCATCNDecoder(nn.Module):
                 min_lag=min_lag_samples,
                 max_lag=max_lag_samples,
                 dropout=dropout,
-                head_dropout=head_dropout
+                head_dropout=head_dropout,
+                subsample_stride=subsample_stride
             )
         elif arch == "msca":
             self.model = MSCAMultiBandCATCNDecoder(
