@@ -50,31 +50,10 @@ from src.selective_aad.temporal_gate import SignalQualityMonitor, StickyHysteres
 from src.audio.steering_engine import AudioSteeringDSP
 from src.audio.metrics import evaluate_audio_steering_trial
 from training.montages import MONTAGES, DTU_CHANNELS
+from training.train_multiband_catcn import discover_eeg_subjects
 from baselines.ridge_aad import load_subject_examples, subject_files
 
 FS = 64  # Feature processing rate in Hz
-
-def discover_eeg_directory(custom_dir: Optional[str] = None) -> List[Path]:
-    if custom_dir:
-        p = Path(custom_dir)
-        if p.exists():
-            files = sorted(list(p.glob("*data_preproc*.mat")))
-            if files:
-                return files
-    candidates = [
-        Path("/kaggle/input/datasets/lokeshgile/dtu-dataset"),
-        Path("/kaggle/input/dtu-dataset"),
-        Path("/kaggle/input/dtu-bci-dataset"),
-        Path("/kaggle/input/DTU_Dataset"),
-        REPO_ROOT / "data" / "eeg",
-        REPO_ROOT / "datasets" / "dtu",
-    ]
-    for c in candidates:
-        if c.exists():
-            files = sorted(list(c.glob("*data_preproc*.mat")))
-            if files:
-                return files
-    return []
 
 def discover_audio_directory(custom_dir: Optional[str] = None) -> Optional[Path]:
     if custom_dir:
@@ -92,6 +71,13 @@ def discover_audio_directory(custom_dir: Optional[str] = None) -> Optional[Path]
     for c in candidates:
         if c.exists() and len(list(c.glob("*.wav"))) > 0:
             return c
+    if Path("/kaggle/input").exists():
+        import glob
+        try:
+            for w in glob.glob("/kaggle/input/**/*.wav", recursive=True):
+                return Path(w).parent
+        except Exception:
+            pass
     return None
 
 def synthesize_acoustic_speech(envelope_64hz: np.ndarray, target_fs: int = 44100) -> np.ndarray:
@@ -261,8 +247,8 @@ def run_realtime_stream(
     n_ch = len(montage_channels)
 
     # 1. Discover subject file
-    dtu_files = discover_eeg_directory(eeg_dir)
-    target_file = next((f for f in dtu_files if f.stem.split("_")[0].upper() == subject_id.upper()), None)
+    dtu_files = discover_eeg_subjects(eeg_dir)
+    target_file = next((f for f in dtu_files if f.stem.split("_")[0].upper() == subject_id.upper() or f.stem.upper().startswith(subject_id.upper())), None)
     if target_file is None:
         if smoke_test:
             print("  [SMOKE TEST]: Synthesizing mock DTU subject and trials for rapid verification...")
@@ -274,7 +260,7 @@ def run_realtime_stream(
             trial_idx = 0
             ex = exs[0]
         else:
-            raise FileNotFoundError(f"Could not find DTU file for subject {subject_id} in {eeg_dir}")
+            raise FileNotFoundError(f"Could not find DTU file for subject {subject_id}. Discovered {len(dtu_files)} files: {[f.name for f in dtu_files]}")
     else:
         print(f"  [EEG FILE]: {target_file.name}")
         exs = list(load_subject_examples(target_file))
