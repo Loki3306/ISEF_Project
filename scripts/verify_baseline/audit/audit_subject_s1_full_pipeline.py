@@ -84,11 +84,9 @@ def run_s1_full_cohort_audit(
     raw_data: RawDTUSubjectData = load_raw_dtu_file(raw_eeg_path)
     print(f"      Loaded in {time.time() - t_load_eeg:.2f}s | Sample Rate = {raw_data.fs:.0f} Hz | Total Trials = {len(raw_data.trials)}")
     
-    # 2. Load Neural Ensemble & Adapter
+    # 2. Load Neural Ensemble (100% Strict Trained Weights)
     print(f"\n[2/4] Loading NeuroConformer-v4 3-member ensemble from {checkpoints_dir.name}...")
     models = load_local_model_ensemble(checkpoints_dir, device)
-    adapter = SpatialEEGAdapter(channels=16).to(device)
-    adapter.eval()
     
     # 3. Determine Trial Schedule
     all_trial_indices = list(range(len(raw_data.trials)))
@@ -264,7 +262,6 @@ def run_s1_full_cohort_audit(
                 t_b = torch.from_numpy(w_b_std).unsqueeze(0).float().to(device)
                 
                 with torch.no_grad():
-                    t_e = adapter(t_e)
                     deltas = [m(t_e, t_a, t_b)[0] for m in models]
                     delta = torch.stack(deltas).mean(dim=0)
                     m_val = delta.item()
