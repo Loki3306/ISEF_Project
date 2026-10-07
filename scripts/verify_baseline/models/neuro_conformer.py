@@ -179,16 +179,87 @@ class ConformerConvModule(nn.Module):
         return residual + x.transpose(1, 2)  # (B, T, D)
 
 
+class DifferentialMultiheadAttention(nn.Module):
+    """
+    Differential Multi-Head Attention Mechanism (AFA-Net / DiffTransformer).
+    Computes DiffAttn = (Softmax(A1) - lambda * Softmax(A2)) * V
+    Actively cancels common-mode background EEG neural noise and myogenic artifacts.
+    """
+    def __init__(self, d_model: int, num_heads: int = 4, dropout: float = 0.1, lambda_init: float = 0.8):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.head_dim = d_model // num_heads
+        assert self.head_dim % 2 == 0, "head_dim must be even to split into 2 sub-heads"
+        self.d_sub = self.head_dim // 2
+        
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        # Learnable lambda parameters per head for noise cancellation
+        self.lambda_q1 = nn.Parameter(torch.zeros(num_heads, self.d_sub))
+        self.lambda_k1 = nn.Parameter(torch.zeros(num_heads, self.d_sub))
+        self.lambda_q2 = nn.Parameter(torch.zeros(num_heads, self.d_sub))
+        self.lambda_k2 = nn.Parameter(torch.zeros(num_heads, self.d_sub))
+        self.lambda_init = lambda_init
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+        # q_in: (B, T_q, D), k_in: (B, T_k, D), v_in: (B, T_k, D)
+        B, T_q, D = q_in.shape
+        T_k = k_in.shape[1]
+        H, d_sub = self.num_heads, self.d_sub
+        
+        q = self.q_proj(q_in).view(B, T_q, H, 2, d_sub).permute(3, 0, 2, 1, 4)  # (2, B, H, T_q, d_sub)
+        k = self.k_proj(k_in).view(B, T_k, H, 2, d_sub).permute(3, 0, 2, 1, 4)  # (2, B, H, T_k, d_sub)
+        v = self.v_proj(v_in).view(B, T_k, H, self.head_dim).transpose(1, 2)    # (B, H, T_k, head_dim)
+        
+        q1, q2 = q[0], q[1]  # (B, H, T_q, d_sub)
+        k1, k2 = k[0], k[1]  # (B, H, T_k, d_sub)
+        
+        scale = 1.0 / math.sqrt(d_sub)
+        attn1 = torch.matmul(q1, k1.transpose(-2, -1)) * scale  # (B, H, T_q, T_k)
+        attn2 = torch.matmul(q2, k2.transpose(-2, -1)) * scale  # (B, H, T_q, T_k)
+        
+        if attn_mask is not None:
+            if attn_mask.dim() == 2:
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+            attn1 = attn1 + attn_mask
+            attn2 = attn2 + attn_mask
+            
+        p1 = F.softmax(attn1, dim=-1)
+        p2 = F.softmax(attn2, dim=-1)
+        
+        lam = (torch.exp((self.lambda_q1 * self.lambda_k1).sum(dim=-1)) - 
+               torch.exp((self.lambda_q2 * self.lambda_k2).sum(dim=-1)) + self.lambda_init).clamp(0.0, 1.0)
+        lam = lam.view(1, H, 1, 1)
+        
+        diff_attn = p1 - lam * p2
+        diff_attn = self.dropout(diff_attn)
+        
+        out = torch.matmul(diff_attn, v)  # (B, H, T_q, head_dim)
+        out = out.transpose(1, 2).contiguous().view(B, T_q, D)
+        return self.out_proj(out)
+
+
 class ConformerBlock(nn.Module):
     """
     Full Macaron-style Conformer Block.
-    x -> 0.5*FFN1 -> MHSA -> ConvModule -> 0.5*FFN2 -> LayerNorm
+    x -> 0.5*FFN1 -> MHSA (Differential or Standard) -> ConvModule -> 0.5*FFN2 -> LayerNorm
     """
-    def __init__(self, d_model: int, num_heads: int = 4, ffn_dim: int = 192, conv_kernel: int = 31, dropout: float = 0.1):
+    def __init__(self, d_model: int, num_heads: int = 4, ffn_dim: int = 192, conv_kernel: int = 31,
+                 dropout: float = 0.1, use_diff_attn: bool = False):
         super().__init__()
         self.ffn1 = FeedForwardModule(d_model, ffn_dim, dropout)
         self.ln_sa = nn.LayerNorm(d_model)
-        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.use_diff_attn = use_diff_attn
+        if use_diff_attn:
+            self.self_attn = DifferentialMultiheadAttention(d_model, num_heads, dropout=dropout)
+        else:
+            self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
         self.sa_dropout = nn.Dropout(dropout)
         self.conv_module = ConformerConvModule(d_model, kernel_size=conv_kernel, dropout=dropout)
         self.ffn2 = FeedForwardModule(d_model, ffn_dim, dropout)
@@ -198,9 +269,12 @@ class ConformerBlock(nn.Module):
         # x: (B, T, D)
         x = x + 0.5 * self.ffn1(x)
         
-        # Multi-Head Self Attention
+        # Self Attention (Differential or Standard)
         sa_in = self.ln_sa(x)
-        sa_out, _ = self.self_attn(sa_in, sa_in, sa_in)
+        if self.use_diff_attn:
+            sa_out = self.self_attn(sa_in, sa_in, sa_in)
+        else:
+            sa_out, _ = self.self_attn(sa_in, sa_in, sa_in)
         x = x + self.sa_dropout(sa_out)
         
         # Conformer Convolution Module
@@ -217,9 +291,10 @@ class ConformerBlock(nn.Module):
 
 class CausalPhysiologicalCrossAttention(nn.Module):
     """
-    Causal Latency-Constrained Cross-Modal Attention.
+    Causal Latency-Constrained Differential Cross-Modal Attention.
     Cortical EEG tokens query cochlear audio tokens with a physiological ERP mask
     restricting attention to tau in [min_lag, max_lag] (-31 ms to +281 ms).
+    Uses Differential Attention to cancel common-mode background EEG noise.
     """
     def __init__(self, d_model: int, num_heads: int = 4, ffn_dim: int = 192, min_lag: int = -2, max_lag: int = 18, dropout: float = 0.1):
         super().__init__()
@@ -229,7 +304,7 @@ class CausalPhysiologicalCrossAttention(nn.Module):
         
         self.ln_q = nn.LayerNorm(d_model)
         self.ln_kv = nn.LayerNorm(d_model)
-        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.cross_attn = DifferentialMultiheadAttention(d_model, num_heads, dropout=dropout)
         self.attn_dropout = nn.Dropout(dropout)
         
         self.ffn = FeedForwardModule(d_model, ffn_dim, dropout)
@@ -262,7 +337,7 @@ class CausalPhysiologicalCrossAttention(nn.Module):
         q = self.ln_q(z_eeg)
         kv = self.ln_kv(z_audio)
         
-        cross_out, _ = self.cross_attn(q, kv, kv, attn_mask=attn_mask)
+        cross_out = self.cross_attn(q, kv, kv, attn_mask=attn_mask)
         x = z_eeg + self.attn_dropout(cross_out)
         
         x = x + self.ffn(x)
@@ -270,15 +345,14 @@ class CausalPhysiologicalCrossAttention(nn.Module):
 
 
 # -------------------------------------------------------------------------------------------------
-# 4. TEMPORAL SALIENCE & BILINEAR ALIGNMENT SCORING HEAD
+# 4. TEMPORAL SALIENCE & BILINEAR ALIGNMENT SCORING HEAD WITH RESIDUAL ANCHOR
 # -------------------------------------------------------------------------------------------------
 
 class SiameseCrossModalScoringHead(nn.Module):
     """
-    Energy-Aware Temporal Salience Weighted Multi-Lag Alignment Head.
+    Energy-Aware Temporal Salience Weighted Multi-Lag Alignment Head with Residual Linear Anchor.
     Scores the compatibility between cross-attended EEG and Audio stream.
-    Guaranteed machine-precision anti-symmetry when evaluated as:
-    Delta(A, B) = Score(EEG, A) - Score(EEG, B).
+    Guaranteed machine-precision anti-symmetry: Delta(A, B) = Score(EEG, A) - Score(EEG, B).
     """
     def __init__(self, d_model: int = 80, min_lag: int = -2, max_lag: int = 18, dropout: float = 0.2):
         super().__init__()
@@ -293,8 +367,8 @@ class SiameseCrossModalScoringHead(nn.Module):
             nn.Conv1d(32, 1, kernel_size=1)
         )
         
-        # Bilinear cross-correlation projection
-        self.classifier = nn.Linear(d_model * self.num_lags, 1, bias=False)
+        # Dual-path bilinear classifier: salience-weighted cross-correlations + unweighted residual anchor
+        self.classifier = nn.Linear(d_model * self.num_lags * 2, 1, bias=False)
         self.dropout = nn.Dropout(dropout)
         
     def score_stream(self, z_cross: torch.Tensor, z_audio: torch.Tensor) -> torch.Tensor:
@@ -310,6 +384,7 @@ class SiameseCrossModalScoringHead(nn.Module):
         weights = F.softmax(salience_logits, dim=-1)  # (B, 1, T)
         
         corrs = []
+        corrs_unw = []
         for tau in range(self.min_lag, self.max_lag + 1):
             if tau > 0:
                 zc_s = zc_norm[:, :, tau:]
@@ -325,10 +400,16 @@ class SiameseCrossModalScoringHead(nn.Module):
                 w_s = weights
                 
             w_norm = w_s / (w_s.sum(dim=-1, keepdim=True) + 1e-8)
-            r_tau = (zc_s * za_s * w_norm).sum(dim=-1)  # (B, D)
+            r_tau = (zc_s * za_s * w_norm).sum(dim=-1)   # Salience-weighted (B, D)
+            r_unw = (zc_s * za_s).mean(dim=-1)           # Unweighted residual anchor (B, D)
             corrs.append(r_tau)
+            corrs_unw.append(r_unw)
             
-        r_all = self.dropout(torch.stack(corrs, dim=-1).view(B, -1))  # (B, D * num_lags)
+        r_all = torch.cat([
+            torch.stack(corrs, dim=-1).view(B, -1),
+            torch.stack(corrs_unw, dim=-1).view(B, -1)
+        ], dim=-1)
+        r_all = self.dropout(r_all)
         return self.classifier(r_all).squeeze(-1)  # (B,)
         
     def forward(self, z_cross_a: torch.Tensor, z_audio_a: torch.Tensor,
@@ -345,11 +426,12 @@ class SiameseCrossModalScoringHead(nn.Module):
 
 class NeuroConformer_EEGEncoder(nn.Module):
     """
-    Modular EEG Encoder wrapping Dipole Beamformer, SincNet, Subsampling, and EEG Conformer.
+    Modular EEG Encoder wrapping InstanceNorm, Dipole Beamformer, SincNet, Subsampling, and Diff-Conformer.
     Accepts (B, 8, T) -> returns (B, D, T // subsample_stride).
     """
     def __init__(self, in_channels: int = 8, d_model: int = 80, conformer_blocks: int = 2,
-                 num_heads: int = 4, ffn_dim: int = 160, dropout: float = 0.15, subsample_stride: int = 2):
+                 num_heads: int = 4, ffn_dim: int = 160, dropout: float = 0.15, subsample_stride: int = 2,
+                 use_diff_attn: bool = True):
         super().__init__()
         self.subsample_stride = subsample_stride
         self.beamformer = BilateralDipoleBeamformer(in_channels=in_channels)
@@ -361,13 +443,16 @@ class NeuroConformer_EEGEncoder(nn.Module):
             nn.SiLU()
         )
         self.conformer = nn.Sequential(*[
-            ConformerBlock(d_model=d_model, num_heads=num_heads, ffn_dim=ffn_dim, conv_kernel=31, dropout=dropout)
+            ConformerBlock(d_model=d_model, num_heads=num_heads, ffn_dim=ffn_dim, conv_kernel=31,
+                           dropout=dropout, use_diff_attn=use_diff_attn)
             for _ in range(conformer_blocks)
         ])
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T)
-        spatial = self.beamformer(x)
+        # Subject-invariant instance normalization per trial across time
+        x_norm = (x - x.mean(dim=-1, keepdim=True)) / (x.std(dim=-1, keepdim=True) + 1e-6)
+        spatial = self.beamformer(x_norm)
         spectral = self.sinc_net(spatial)
         feat = self.proj(spectral)       # (B, D, T // stride)
         feat_t = feat.transpose(1, 2)    # (B, T // stride, D)

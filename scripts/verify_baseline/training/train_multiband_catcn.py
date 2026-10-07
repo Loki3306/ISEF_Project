@@ -787,8 +787,10 @@ def run_multiband_training(args):
             with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
                 delta, (l1, l2), _ = model(bx, c1, c2)
                 if args.loss == 'softplus':
-                    # Smooth logistic margin loss: eliminates hinge dead-zone while bounding gradients
-                    loss = (args.loss_temp * F.softplus((args.margin - target_sign * delta) / args.loss_temp)).mean()
+                    # Focal smooth logistic margin loss: downweights already well-separated windows, focuses gradient on ambiguous trials
+                    p_correct = torch.sigmoid((target_sign * delta) / args.loss_temp)
+                    focal_weight = torch.clamp(1.0 - p_correct, min=0.15, max=1.0)
+                    loss = (focal_weight * args.loss_temp * F.softplus((args.margin - target_sign * delta) / args.loss_temp)).mean()
                 else:
                     loss = torch.clamp(args.margin - target_sign * delta, min=0.0).mean()
                 
@@ -820,7 +822,9 @@ def run_multiband_training(args):
                 with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
                     delta, (la, lb), _ = model(bx, bya, byb)
                     if args.loss == 'softplus':
-                        v_loss = (args.loss_temp * F.softplus((args.margin - delta) / args.loss_temp)).mean()
+                        p_correct = torch.sigmoid(delta / args.loss_temp)
+                        focal_weight = torch.clamp(1.0 - p_correct, min=0.15, max=1.0)
+                        v_loss = (focal_weight * args.loss_temp * F.softplus((args.margin - delta) / args.loss_temp)).mean()
                     else:
                         v_loss = torch.clamp(args.margin - delta, min=0.0).mean()
                 val_loss += v_loss.item() * bx.size(0)
@@ -1054,11 +1058,11 @@ def run_multiband_training(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-Band Cochlear Gammatone + CA-TCN Training")
     parser.add_argument("--montage", type=str, default="near_ear_expanded", choices=list(MONTAGES.keys()))
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--patience", type=int, default=4, help="Early stopping patience (exit if validation accuracy fails to improve for N epochs)")
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight_decay", type=float, default=3e-2)
+    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience (exit if validation accuracy fails to improve for N epochs)")
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1.2e-4)
+    parser.add_argument("--weight_decay", type=float, default=5e-2)
     parser.add_argument("--window_sec", type=float, default=5.0)
     parser.add_argument("--hop_sec", type=float, default=1.0)
     parser.add_argument("--test_split", type=float, default=0.2)
@@ -1075,11 +1079,11 @@ if __name__ == "__main__":
     parser.add_argument("--margin", type=float, default=0.35, help="Separation margin between attended and unattended streams")
     parser.add_argument("--use_sinc", action="store_true", default=True, help="Enable biological SincNet filterbank (Sinc-CATCN v2)")
     parser.add_argument("--no_sinc", action="store_false", dest="use_sinc", help="Disable SincNet (revert to legacy baseline)")
-    parser.add_argument("--dropout", type=float, default=0.35)
-    parser.add_argument("--head_dropout", type=float, default=0.25, help="Dropout on cross-correlation head features to prevent memorization")
-    parser.add_argument("--subband_mask_prob", type=float, default=0.25)
-    parser.add_argument("--time_mask_prob", type=float, default=0.20, help="Temporal SpecAugment (mask 250ms audio chunk to prevent story memorization)")
-    parser.add_argument("--channel_mask_prob", type=float, default=0.0, help="Probability of masking 1 random EEG channel during training")
+    parser.add_argument("--dropout", type=float, default=0.25)
+    parser.add_argument("--head_dropout", type=float, default=0.35, help="Dropout on cross-correlation head features to prevent memorization")
+    parser.add_argument("--subband_mask_prob", type=float, default=0.30)
+    parser.add_argument("--time_mask_prob", type=float, default=0.25, help="Temporal SpecAugment (mask 250ms audio chunk to prevent story memorization)")
+    parser.add_argument("--channel_mask_prob", type=float, default=0.25, help="Probability of masking 1 random EEG channel during training")
     parser.add_argument("--include_broadband", action="store_true", default=True, help="Include 1D broadband envelope as Channel 0 alongside 8 Gammatone subbands")
     parser.add_argument("--no_broadband", action="store_false", dest="include_broadband", help="Disable broadband envelope inclusion")
     parser.add_argument("--adapt", action="store_true", default=True, help="Enable few-shot spatial adaptation")

@@ -68,8 +68,11 @@ def run_multiband_ablations(args):
     # 1. Locate and Load Pre-Trained Checkpoint
     checkpoint_candidates = [
         Path(args.checkpoint_path) if args.checkpoint_path else None,
+        Path("/kaggle/working/diff_conformer_best.pt"),
+        Path("/kaggle/working/neuro_conformer_fast_best.pt"),
         Path("/kaggle/working/neuro_conformer_best.pt"),
         Path("/kaggle/working/msca_catcn_v3_best.pt"),
+        REPO_ROOT / "results" / "multiband_catcn" / "diff_conformer_best.pt",
         REPO_ROOT / "results" / "multiband_catcn" / "neuro_conformer_best.pt",
         REPO_ROOT / "results" / "multiband_catcn" / "sinc_multiband_catcn_best.pt",
         Path("/kaggle/working/sinc_multiband_catcn_best.pt"),
@@ -84,6 +87,11 @@ def run_multiband_ablations(args):
             ckpt_path = cand
             break
 
+    # Auto-detect conformer arch if checkpoint name contains conformer
+    if ckpt_path and "conformer" in str(ckpt_path).lower() and args.arch == "sinc":
+        args.arch = "conformer"
+
+    subsample_stride = getattr(args, 'subsample_stride', 2)
     model = MultiBandCATCNDecoder(
         eeg_channels=n_ch,
         audio_bands=audio_channels,
@@ -92,7 +100,8 @@ def run_multiband_ablations(args):
         max_lag_samples=args.max_lag_samples,
         head_type=args.head_type,
         use_sinc=args.use_sinc,
-        arch=args.arch
+        arch=args.arch,
+        subsample_stride=subsample_stride
     ).to(device)
 
     if ckpt_path:
@@ -403,6 +412,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_lag_samples", type=int, default=18)
     parser.add_argument("--head_type", type=str, default="linear")
     parser.add_argument("--arch", type=str, default="sinc", choices=["conformer", "neuroconformer", "msca", "sinc", "baseline"])
+    parser.add_argument("--subsample_stride", type=int, default=2, help="Temporal subsampling stride for Conformer attention (default: 2)")
     parser.add_argument("--use_sinc", action="store_true", default=True)
     parser.add_argument("--include_broadband", action="store_true", default=True)
     parser.add_argument("--calib_trials", type=int, default=12)
