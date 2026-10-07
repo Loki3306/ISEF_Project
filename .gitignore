@@ -82,6 +82,7 @@ results/*
 logs/
 scratch/
 *.wav
+!data/audio/*.wav
 
 .research/
 .runs/
