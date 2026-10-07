@@ -80,3 +80,49 @@ class StreamingCausalEEGFilter:
     def get_group_delay_ms(self) -> float:
         """Computes the mean group delay in milliseconds."""
         return self.get_group_delay_samples() * 1000.0 / self.fs
+
+
+class DualBandCausalEEGFilter:
+    """
+    Simultaneous Dual-Band Streaming Causal EEG Filter.
+    Extracts:
+      1. ERP Phase Tracking Band (default: 1.0 - 6.5 Hz): captures slow cortical auditory potentials.
+      2. Alpha Lateralization Band (default: 8.0 - 13.0 Hz): captures attentional parietal-temporal alpha suppression.
+    
+    Both sub-filters maintain independent causal SOS filter states (zi/zf) across chunks.
+    """
+    def __init__(
+        self,
+        erp_lowcut: float = 1.0,
+        erp_highcut: float = 6.5,
+        alpha_lowcut: float = 8.0,
+        alpha_highcut: float = 13.0,
+        fs: float = 64.0,
+        order: int = 2,
+        n_channels: int = 8
+    ):
+        self.erp_filter = StreamingCausalEEGFilter(
+            lowcut=erp_lowcut, highcut=erp_highcut, fs=fs, order=order, n_channels=n_channels
+        )
+        self.alpha_filter = StreamingCausalEEGFilter(
+            lowcut=alpha_lowcut, highcut=alpha_highcut, fs=fs, order=order, n_channels=n_channels
+        )
+        self.n_channels = n_channels
+        self.fs = fs
+
+    def reset(self):
+        """Resets persistent filter states for both bands."""
+        self.erp_filter.reset()
+        self.alpha_filter.reset()
+
+    def process_chunk(self, chunk: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Processes streaming multichannel EEG chunk.
+        Returns:
+            erp_chunk: [n_samples, n_channels] (1.0 - 6.5 Hz)
+            alpha_chunk: [n_samples, n_channels] (8.0 - 13.0 Hz)
+        """
+        erp_c = self.erp_filter.process_chunk(chunk)
+        alpha_c = self.alpha_filter.process_chunk(chunk)
+        return erp_c, alpha_c
+

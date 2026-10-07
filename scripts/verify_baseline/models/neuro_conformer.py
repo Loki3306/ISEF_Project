@@ -37,9 +37,10 @@ import torch.nn.functional as F
 
 class BilateralDipoleBeamformer(nn.Module):
     """
-    Extracts 4 hemispheric differential dipole pairs from 8 wearable EEG channels
-    and concatenates them with the original channels to yield 12 spatial channels.
-    Channels: 0:Fp1, 1:Fp2, 2:F7, 3:F8, 4:T7, 5:T8, 6:P7, 7:P8
+    Extracts hemispheric differential dipole pairs from wearable EEG channels
+    and concatenates them with the original channels.
+    - 8 Channels: 4 dipoles (Fp1-Fp2, F7-F8, T7-T8, P7-P8) -> 12 spatial channels.
+    - 16 Channels (Dual-Band: 8ch ERP + 8ch Alpha): 4 ERP dipoles + 4 Alpha dipoles -> 24 spatial channels.
     """
     def __init__(self, in_channels: int = 8):
         super().__init__()
@@ -48,12 +49,28 @@ class BilateralDipoleBeamformer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T)
         if x.shape[1] == 8:
-            fp_dipole = x[:, 0:1, :] - x[:, 1:2, :]  # Fp1 - Fp2 (Frontal)
-            at_dipole = x[:, 2:3, :] - x[:, 3:4, :]  # F7 - F8   (Anterior Temporal)
-            mt_dipole = x[:, 4:5, :] - x[:, 5:6, :]  # T7 - T8   (Auditory Cortex / Heschl's)
-            pt_dipole = x[:, 6:7, :] - x[:, 7:8, :]  # P7 - P8   (Posterior Temporal)
-            return torch.cat([x, fp_dipole, at_dipole, mt_dipole, pt_dipole], dim=1)  # (B, 12, T)
+            d0 = x[:, 0:1, :] - x[:, 1:2, :]  # L1 - R1 (Frontal / Anterior)
+            d1 = x[:, 2:3, :] - x[:, 3:4, :]  # L2 - R2 (Mid-Temporal)
+            d2 = x[:, 4:5, :] - x[:, 5:6, :]  # L3 - R3 (Auditory Cortex / Heschl's)
+            d3 = x[:, 6:7, :] - x[:, 7:8, :]  # L4 - R4 (Posterior Temporal / Parietal)
+            return torch.cat([x, d0, d1, d2, d3], dim=1)  # (B, 12, T)
+        elif x.shape[1] == 16:
+            # Band 1: ERP (0..7)
+            d_erp0 = x[:, 0:1, :] - x[:, 1:2, :]
+            d_erp1 = x[:, 2:3, :] - x[:, 3:4, :]
+            d_erp2 = x[:, 4:5, :] - x[:, 5:6, :]
+            d_erp3 = x[:, 6:7, :] - x[:, 7:8, :]
+            # Band 2: Alpha (8..15)
+            d_alp0 = x[:, 8:9, :] - x[:, 9:10, :]
+            d_alp1 = x[:, 10:11, :] - x[:, 11:12, :]
+            d_alp2 = x[:, 12:13, :] - x[:, 13:14, :]
+            d_alp3 = x[:, 14:15, :] - x[:, 15:16, :]
+            return torch.cat([
+                x[:, :8, :], d_erp0, d_erp1, d_erp2, d_erp3,
+                x[:, 8:, :], d_alp0, d_alp1, d_alp2, d_alp3
+            ], dim=1)  # (B, 24, T)
         return x
+
 
 
 class SincConvEEG(nn.Module):
@@ -435,7 +452,7 @@ class NeuroConformer_EEGEncoder(nn.Module):
         super().__init__()
         self.subsample_stride = subsample_stride
         self.beamformer = BilateralDipoleBeamformer(in_channels=in_channels)
-        spatial_channels = 12 if in_channels == 8 else in_channels
+        spatial_channels = 24 if in_channels == 16 else (12 if in_channels == 8 else in_channels)
         self.sinc_net = SincConvEEG(out_bands=8, kernel_size=65, sample_rate=64.0)
         self.proj = nn.Sequential(
             nn.Conv1d(spatial_channels * 8, d_model, kernel_size=3, stride=subsample_stride, padding=1, bias=False),

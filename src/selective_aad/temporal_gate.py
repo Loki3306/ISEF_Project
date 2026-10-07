@@ -546,6 +546,131 @@ class AnalyticalBayesianGate:
         }
 
 
+class BayesianHMMGate:
+    """
+    Production-Grade Bayesian Hidden Markov Model (HMM) Auditory Gate.
+    Calculates exact online Bayesian posterior probability P(S_t | Delta_{1:t})
+    with sticky self-transition inertia, continuous Gaussian emissions,
+    temperature normalization, artifact freezing, and click-free gain slew-limiting.
+    """
+    def __init__(
+        self,
+        mu: float = 0.35,
+        sigma: float = 0.50,
+        switch_prior: float = 0.015,
+        decision_threshold: float = 0.70,
+        boost_db: float = 6.0,
+        temperature: float = 1.0,
+        deadband_timeout_steps: int = 24
+    ):
+        self.mu = float(mu)
+        self.sigma = max(1e-3, float(sigma))
+        self.switch_prior = float(switch_prior)
+        self.decision_threshold = float(decision_threshold)
+        self.temperature = max(1e-4, float(temperature))
+        self.boost_db = float(boost_db)
+        self.boost_lin = 10.0 ** (self.boost_db / 20.0)
+        self.deadband_timeout_steps = int(deadband_timeout_steps)
+        
+        # State tracking
+        self.belief_a = 0.5
+        self.belief_b = 0.5
+        self.current_state = "NEUTRAL_HOLD"
+        self.gain_a = 0.5
+        self.gain_b = 0.5
+        self.deadband_counter = 0
+
+    def reset(self):
+        self.belief_a = 0.5
+        self.belief_b = 0.5
+        self.current_state = "NEUTRAL_HOLD"
+        self.gain_a = 0.5
+        self.gain_b = 0.5
+        self.deadband_counter = 0
+
+    def update(self, raw_margin: float, is_artifact: bool = False) -> Dict[str, Any]:
+        m = float(raw_margin)
+        
+        # If artifact, freeze beliefs and retain state
+        if is_artifact:
+            return self._format_output(m, switched=False, is_artifact=True)
+            
+        # 1. Temperature-scaled margin
+        m_scaled = m / self.temperature
+        
+        # 2. Sticky Markov transition step
+        p_stay = 1.0 - self.switch_prior
+        p_switch = self.switch_prior
+        prior_a = self.belief_a * p_stay + self.belief_b * p_switch
+        prior_b = self.belief_b * p_stay + self.belief_a * p_switch
+        
+        # 3. Gaussian log-likelihood ratio update
+        # LLR = 2 * m * mu / sigma^2
+        llr = (2.0 * m_scaled * self.mu) / (self.sigma ** 2)
+        llr = float(np.clip(llr, -30.0, 30.0))
+        lr = float(np.exp(llr))
+        
+        unnorm_a = prior_a * lr
+        unnorm_b = prior_b
+        tot = unnorm_a + unnorm_b + 1e-12
+        self.belief_a = float(unnorm_a / tot)
+        self.belief_b = 1.0 - self.belief_a
+        
+        # 4. State transition logic
+        prev_state = self.current_state
+        switched = False
+        
+        if self.belief_a >= self.decision_threshold:
+            candidate = "LOCKED_A"
+            self.deadband_counter = 0
+        elif self.belief_b >= self.decision_threshold:
+            candidate = "LOCKED_B"
+            self.deadband_counter = 0
+        else:
+            self.deadband_counter += 1
+            if self.deadband_counter >= self.deadband_timeout_steps:
+                candidate = "NEUTRAL_HOLD"
+            else:
+                candidate = prev_state # Retain sticky lock in deadband
+                
+        if candidate != prev_state and candidate in ["LOCKED_A", "LOCKED_B"]:
+            switched = True
+        self.current_state = candidate
+        
+        return self._format_output(m, switched=switched, is_artifact=False)
+
+    def _format_output(self, m: float, switched: bool, is_artifact: bool) -> Dict[str, Any]:
+        if self.current_state == "LOCKED_A":
+            decision = "A"
+            target_ga, target_gb = 1.0, 1.0 / self.boost_lin
+        elif self.current_state == "LOCKED_B":
+            decision = "B"
+            target_ga, target_gb = 1.0 / self.boost_lin, 1.0
+        else:
+            decision = "HOLD"
+            target_ga, target_gb = 0.5, 0.5
+            
+        self.gain_a = 0.4 * self.gain_a + 0.6 * target_ga
+        self.gain_b = 0.4 * self.gain_b + 0.6 * target_gb
+        
+        return {
+            "decision": decision,
+            "state": self.current_state,
+            "confidence": float(abs(self.belief_a - self.belief_b)),
+            "prob_a": self.belief_a,
+            "prob_b": self.belief_b,
+            "raw_margin": m,
+            "smoothed_margin": float(self.belief_a - 0.5) * 2.0, # normalized [-1, 1]
+            "gain_a": float(self.gain_a),
+            "gain_b": float(self.gain_b),
+            "switched": switched,
+            "is_hold": (self.current_state == "NEUTRAL_HOLD"),
+            "is_artifact": is_artifact,
+            "deadband_counter": self.deadband_counter,
+        }
+
+
+
 class TinyTemporalGate(nn.Module):
     """
     Lightweight Causal Time-Series Gating Controller (PyTorch Module).

@@ -32,9 +32,9 @@ if str(VERIFY_ROOT) not in sys.path:
     sys.path.insert(0, str(VERIFY_ROOT))
 
 from models.multiband_catcn import MultiBandCATCNDecoder
-from src.streaming.causal_filters import StreamingCausalEEGFilter
+from src.streaming.causal_filters import StreamingCausalEEGFilter, DualBandCausalEEGFilter
 from src.models.spatial_adapter import SpatialEEGAdapter
-from src.selective_aad.temporal_gate import SignalQualityMonitor, StickyHysteresisGate
+from src.selective_aad.temporal_gate import SignalQualityMonitor, StickyHysteresisGate, BayesianHMMGate
 from src.selective_aad.metrics import calculate_selective_metrics, compute_temporal_stability_metrics
 from baselines.ridge_aad import load_subject_examples, TrialExample
 from training.montages import MONTAGES, DTU_CHANNELS
@@ -444,8 +444,12 @@ def run_multiband_training(args):
     print("=" * 96)
     
     # 1. Discover Subjects
-    all_paths = discover_eeg_subjects(args.eeg_dir)
-    print(f"[DATA] Discovered {len(all_paths)} total subject file(s) on disk: {[p.name for p in all_paths]}")
+    if args.smoke_test and not args.eeg_dir:
+        all_paths = [Path("S1_data_preproc.mat"), Path("S2_data_preproc.mat")]
+        print(f"[DATA] Smoke test mode: using mock subjects {[p.name for p in all_paths]}")
+    else:
+        all_paths = discover_eeg_subjects(args.eeg_dir)
+        print(f"[DATA] Discovered {len(all_paths)} total subject file(s) on disk: {[p.name for p in all_paths]}")
     
     if args.subjects and args.subjects.lower() != 'all':
         requested = [s.strip().upper() for s in args.subjects.split(",") if s.strip()]
@@ -489,12 +493,18 @@ def run_multiband_training(args):
             raise e
 
     win_samples = int(args.window_sec * FS)
-    causal_eeg_filter = StreamingCausalEEGFilter(
-        lowcut=args.eeg_lowcut, highcut=args.eeg_highcut, fs=FS, order=2, n_channels=n_ch
-    )
-    
-    # 3. Process Subjects into Training/Validation Tensors
-    print(f"\n[DATA PREPARATION]: Extracting causal streaming EEG ({args.eeg_lowcut}-{args.eeg_highcut} Hz) and multi-band envelopes (<{args.audio_lowpass} Hz)...")
+    if getattr(args, "dual_band", False):
+        causal_eeg_filter = DualBandCausalEEGFilter(
+            erp_lowcut=args.eeg_lowcut, erp_highcut=args.eeg_highcut,
+            alpha_lowcut=args.alpha_lowcut, alpha_highcut=args.alpha_highcut,
+            fs=FS, order=2, n_channels=n_ch
+        )
+        print(f"\n[DATA PREPARATION]: Extracting dual-band EEG (ERP: {args.eeg_lowcut}-{args.eeg_highcut} Hz + Alpha: {args.alpha_lowcut}-{args.alpha_highcut} Hz) and multi-band envelopes (<{args.audio_lowpass} Hz)...")
+    else:
+        causal_eeg_filter = StreamingCausalEEGFilter(
+            lowcut=args.eeg_lowcut, highcut=args.eeg_highcut, fs=FS, order=2, n_channels=n_ch
+        )
+        print(f"\n[DATA PREPARATION]: Extracting causal streaming EEG ({args.eeg_lowcut}-{args.eeg_highcut} Hz) and multi-band envelopes (<{args.audio_lowpass} Hz)...")
     t_data_start = time.time()
     
     X_tr_list, YA_tr_list, YB_tr_list = [], [], []
@@ -562,8 +572,14 @@ def run_multiband_training(args):
             
             # Causal EEG filtering + standardization
             causal_eeg_filter.reset()
-            eeg_c = causal_eeg_filter.process_chunk(raw_eeg)
-            eeg_c = (eeg_c - np.mean(eeg_c, axis=0, keepdims=True)) / (np.std(eeg_c, axis=0, keepdims=True) + 1e-12)
+            if getattr(args, "dual_band", False):
+                eeg_erp, eeg_alpha = causal_eeg_filter.process_chunk(raw_eeg)
+                eeg_erp = (eeg_erp - np.mean(eeg_erp, axis=0, keepdims=True)) / (np.std(eeg_erp, axis=0, keepdims=True) + 1e-12)
+                eeg_alpha = (eeg_alpha - np.mean(eeg_alpha, axis=0, keepdims=True)) / (np.std(eeg_alpha, axis=0, keepdims=True) + 1e-12)
+                eeg_c = np.concatenate([eeg_erp, eeg_alpha], axis=-1)
+            else:
+                eeg_c = causal_eeg_filter.process_chunk(raw_eeg)
+                eeg_c = (eeg_c - np.mean(eeg_c, axis=0, keepdims=True)) / (np.std(eeg_c, axis=0, keepdims=True) + 1e-12)
             
             # Causal Audio lowpass + standardization
             ya_c = butter_lowpass_sosfilt(cur_ya, args.audio_lowpass, FS, order=2).astype(np.float32)
@@ -571,9 +587,17 @@ def run_multiband_training(args):
             ya_c = (ya_c - np.mean(ya_c, axis=-1, keepdims=True)) / (np.std(ya_c, axis=-1, keepdims=True) + 1e-12)
             yb_c = (yb_c - np.mean(yb_c, axis=-1, keepdims=True)) / (np.std(yb_c, axis=-1, keepdims=True) + 1e-12)
             
+            if getattr(args, "include_onsets", False):
+                onset_a = np.maximum(0.0, np.diff(ya_c, prepend=ya_c[:, :1], axis=-1))
+                onset_b = np.maximum(0.0, np.diff(yb_c, prepend=yb_c[:, :1], axis=-1))
+                onset_a = (onset_a - np.mean(onset_a, axis=-1, keepdims=True)) / (np.std(onset_a, axis=-1, keepdims=True) + 1e-12)
+                onset_b = (onset_b - np.mean(onset_b, axis=-1, keepdims=True)) / (np.std(onset_b, axis=-1, keepdims=True) + 1e-12)
+                ya_c = np.concatenate([ya_c, onset_a], axis=0)
+                yb_c = np.concatenate([yb_c, onset_b], axis=0)
+
             if args.include_broadband:
-                bb_a = np.mean(ya_c, axis=0, keepdims=True)
-                bb_b = np.mean(yb_c, axis=0, keepdims=True)
+                bb_a = np.mean(ya_c[:args.audio_bands], axis=0, keepdims=True)
+                bb_b = np.mean(yb_c[:args.audio_bands], axis=0, keepdims=True)
                 ya_c = np.concatenate([bb_a, ya_c], axis=0)
                 yb_c = np.concatenate([bb_b, yb_c], axis=0)
             
@@ -671,9 +695,10 @@ def run_multiband_training(args):
             print(f"[WARNING]: Could not freeze legacy checkpoint: {e}")
 
     # 4. Instantiate Multi-Band CA-TCN Model
-    audio_in_channels = args.audio_bands + (1 if args.include_broadband else 0)
+    actual_eeg_channels = X_tr.shape[1]
+    audio_in_channels = YA_tr.shape[1]
     model = MultiBandCATCNDecoder(
-        eeg_channels=n_ch,
+        eeg_channels=actual_eeg_channels,
         audio_bands=audio_in_channels,
         hidden_dim=args.hidden_dim,
         min_lag_samples=args.min_lag_samples,
@@ -785,7 +810,7 @@ def run_multiband_training(args):
             
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
-                delta, (l1, l2), _ = model(bx, c1, c2)
+                delta, (l1, l2), embeds = model(bx, c1, c2)
                 if args.loss == 'softplus':
                     # Focal smooth logistic margin loss: downweights already well-separated windows, focuses gradient on ambiguous trials
                     p_correct = torch.sigmoid((target_sign * delta) / args.loss_temp)
@@ -793,6 +818,25 @@ def run_multiband_training(args):
                     loss = (focal_weight * args.loss_temp * F.softplus((args.margin - target_sign * delta) / args.loss_temp)).mean()
                 else:
                     loss = torch.clamp(args.margin - target_sign * delta, min=0.0).mean()
+                    
+                if getattr(args, "contrastive_weight", 0.0) > 0 and embeds is not None and len(embeds) == 3:
+                    ze, z1, z2 = embeds
+                    eeg_emb = F.normalize(ze.mean(dim=-1), p=2, dim=-1)
+                    a1_emb = F.normalize(z1.mean(dim=-1), p=2, dim=-1)
+                    a2_emb = F.normalize(z2.mean(dim=-1), p=2, dim=-1)
+                    att_emb = torch.where(swap[:, None], a2_emb, a1_emb)
+                    unatt_emb = torch.where(swap[:, None], a1_emb, a2_emb)
+                    
+                    c_temp = getattr(args, "contrastive_temp", 0.1)
+                    pos_sim = (eeg_emb * att_emb).sum(dim=-1, keepdim=True) / c_temp
+                    unatt_sim = (eeg_emb * unatt_emb).sum(dim=-1, keepdim=True) / c_temp
+                    all_cross_sim = torch.matmul(eeg_emb, att_emb.T) / c_temp
+                    diag_mask = torch.eye(bx.size(0), device=device, dtype=torch.bool)
+                    all_cross_sim.masked_fill_(diag_mask, float('-inf'))
+                    
+                    logits_nce = torch.cat([pos_sim, unatt_sim, all_cross_sim], dim=-1)
+                    targets_nce = torch.zeros(bx.size(0), dtype=torch.long, device=device)
+                    loss = loss + args.contrastive_weight * F.cross_entropy(logits_nce, targets_nce)
                 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -860,9 +904,12 @@ def run_multiband_training(args):
             break
             
     # 6. Final Evaluation on Held-Out Test Split (Multi-Tier Combined Benchmark)
+    gate_name = "Bayesian HMM Gate" if getattr(args, "gate_type", "sticky") == "hmm" else "Sticky Hysteresis Gate"
+    gate_col = "Adapt+HMM Gate(5s)" if getattr(args, "gate_type", "sticky") == "hmm" else "Adapt+Sticky Gate(5s)"
+    adapt_params = actual_eeg_channels * actual_eeg_channels
     print("\n" + "=" * 128)
     print("  GRAND COHORT BENCHMARK ON HELD-OUT TEST TRIALS (UNIFIED BEST METHODS COMBINED)")
-    print(f"  Backbone: {model_tag} | Spatial: 64-Param Identity-Regularized Adapter | Gate: Sticky Hysteresis Gate")
+    print(f"  Backbone: {model_tag} | Spatial: {adapt_params}-Param Identity-Regularized Adapter | Gate: {gate_name}")
     print("=" * 128)
     model.load_state_dict(best_weights)
     model.eval()
@@ -884,7 +931,7 @@ def run_multiband_training(args):
     win_20s_smp = int(20.0 * FS)
     sq_monitor = SignalQualityMonitor()
     
-    print(f"  {'Subject':<8} | {'1. Raw Zero-Shot(5s)':<18} | {'2. Raw 8x8 Adapted(5s)':<22} | {'3. Adapt+Sticky Gate(5s)':<24} | {'10.0s':<7} | {'20.0s':<7} | {'Base(5s)':<8}")
+    print(f"  {'Subject':<8} | {'1. Raw Zero-Shot(5s)':<18} | {'2. Raw Adapted(5s)':<22} | {gate_col:<24} | {'10.0s':<7} | {'20.0s':<7} | {'Base(5s)':<8}")
     print(f"  {'':<8} | {'Acc':<7} {'FalseSw':<9} | {'Acc':<7} {'dRaw':<6} {'FalseSw':<7} | {'Acc':<7} {'Boost%':<7} {'FalseSw':<8} | {'Acc':<7} | {'Acc':<7} | {'Canon':<8}")
     print("  " + "-" * 124)
     
@@ -911,14 +958,15 @@ def run_multiband_training(args):
             t1_acc, t1_fsw = 50.0, 0.0
             gt_test_str = np.array([])
             
-        # --- Tier 2: Dedicated 64-Parameter Spatial Adapter Training ---
+        # --- Tier 2: Dedicated Spatial Adapter Training ---
+        eeg_ch_dim = te_eeg[0].shape[-1]
         if args.adapt and cal_eeg:
             adapter, cal_temp = train_subject_spatial_adapter(
                 model, cal_eeg, cal_ya, cal_yb, win_5s_smp, int(args.hop_sec * FS), device,
-                epochs=args.calib_epochs, lr=args.calib_lr, l2_identity=args.l2_identity, n_channels=n_ch
+                epochs=args.calib_epochs, lr=args.calib_lr, l2_identity=args.l2_identity, n_channels=eeg_ch_dim
             )
         else:
-            adapter = SpatialEEGAdapter(channels=n_ch).to(device)
+            adapter = SpatialEEGAdapter(channels=eeg_ch_dim).to(device)
             cal_temp = 1.0
             
         ad_margins, ad_labels, ad_raw_eeg = evaluate_streaming_trials(
@@ -937,18 +985,28 @@ def run_multiband_training(args):
         else:
             t2_acc, t2_fsw, raw_gain_pp = t1_acc, t1_fsw, 0.0
             
-        # --- Tier 3: Adapted 8x8 + Sticky Hysteresis Gate ---
+        # --- Tier 3: Adapted + Gate (Sticky Hysteresis or Bayesian HMM) ---
         t3_dec_list = []
         t3_gains_attended = []
         for m_seq, eeg_trial in zip(ad_margins, ad_raw_eeg):
-            gate = StickyHysteresisGate(
-                alpha=args.gate_alpha,
-                threshold_switch=args.gate_switch * cal_temp,
-                threshold_maintain=args.gate_maintain * cal_temp,
-                n_confirm=2,
-                deadband_timeout_steps=24,
-                temperature=cal_temp
-            )
+            if getattr(args, "gate_type", "sticky") == "hmm":
+                gate = BayesianHMMGate(
+                    mu=getattr(args, "hmm_mu", 0.35),
+                    sigma=getattr(args, "hmm_sigma", 0.50),
+                    switch_prior=getattr(args, "hmm_switch_prior", 0.015),
+                    decision_threshold=getattr(args, "hmm_threshold", 0.70),
+                    temperature=cal_temp,
+                    deadband_timeout_steps=24
+                )
+            else:
+                gate = StickyHysteresisGate(
+                    alpha=args.gate_alpha,
+                    threshold_switch=args.gate_switch * cal_temp,
+                    threshold_maintain=args.gate_maintain * cal_temp,
+                    n_confirm=2,
+                    deadband_timeout_steps=24,
+                    temperature=cal_temp
+                )
             trial_decs = []
             trial_gains = []
             for v, w_eeg in zip(m_seq, eeg_trial):
@@ -1096,6 +1154,17 @@ if __name__ == "__main__":
     parser.add_argument("--gate_switch", type=float, default=0.35, help="Switching margin threshold theta_switch")
     parser.add_argument("--gate_maintain", type=float, default=0.15, help="Retention margin threshold theta_maintain")
     parser.add_argument("--gate_step_sec", type=float, default=0.5, help="Streaming step size in seconds (2 Hz control rate)")
+    parser.add_argument("--dual_band", action="store_true", default=False, help="Extract dual-band EEG (1-6.5 Hz ERP + 8-13 Hz Alpha lateralization band)")
+    parser.add_argument("--alpha_lowcut", type=float, default=8.0, help="Alpha bandpass low cutoff in Hz (default: 8.0)")
+    parser.add_argument("--alpha_highcut", type=float, default=13.0, help="Alpha bandpass high cutoff in Hz (default: 13.0)")
+    parser.add_argument("--include_onsets", action="store_true", default=False, help="Include 8-band acoustic half-wave rectified onset features")
+    parser.add_argument("--gate_type", type=str, default="sticky", choices=["sticky", "hmm"], help="Decision gate type: 'sticky' (Sticky Hysteresis) vs 'hmm' (Bayesian HMM Forward Filter)")
+    parser.add_argument("--hmm_mu", type=float, default=0.35, help="HMM Gaussian emission mean mu")
+    parser.add_argument("--hmm_sigma", type=float, default=0.50, help="HMM Gaussian emission std sigma")
+    parser.add_argument("--hmm_switch_prior", type=float, default=0.015, help="HMM state transition switch prior probability")
+    parser.add_argument("--hmm_threshold", type=float, default=0.70, help="HMM decision confidence threshold")
+    parser.add_argument("--contrastive_weight", type=float, default=0.0, help="InfoNCE cross-modal alignment loss weight (default: 0.0)")
+    parser.add_argument("--contrastive_temp", type=float, default=0.1, help="InfoNCE temperature tau (default: 0.1)")
     parser.add_argument("--eeg_dir", type=str, default=None)
     parser.add_argument("--audio_dir", type=str, default=None)
     parser.add_argument("--audio_env_file", type=str, default=None)
