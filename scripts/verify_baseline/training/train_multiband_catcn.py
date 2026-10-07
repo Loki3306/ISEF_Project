@@ -553,6 +553,72 @@ def run_multiband_training(args):
         
     print(f"[DATA] Selected {len(all_paths)} DTU subjects for training: {[p.stem for p in all_paths]}")
     
+    # Auto-detect checkpoint configuration if evaluating or loading pre-trained weights
+    ckpt_to_inspect = None
+    if args.checkpoint_path:
+        p = Path(args.checkpoint_path)
+        if p.exists():
+            ckpt_to_inspect = p
+    elif args.eval_only:
+        default_candidates = [
+            Path("/kaggle/working/hybrid_neuro_conformer_best.pt"),
+            Path("/kaggle/working/sinc_multiband_catcn_best.pt"),
+            Path(resolve_output_path(args.output_model))
+        ]
+        for dc in default_candidates:
+            if dc.exists():
+                ckpt_to_inspect = dc
+                args.checkpoint_path = str(dc)
+                print(f"[AUTO DISCOVERY]: Auto-detected pre-trained checkpoint: {dc}")
+                break
+
+    if ckpt_to_inspect and ckpt_to_inspect.exists():
+        try:
+            ckpt_data = torch.load(ckpt_to_inspect, map_location="cpu", weights_only=False)
+            st_inspect = ckpt_data.get("model_state_dict", ckpt_data)
+            
+            # Inspect EEG encoder input dimension
+            for k, v in st_inspect.items():
+                if "eeg_encoder.proj.0.weight" in k:
+                    # In Conformer EEGEncoder: spatial_channels * 8
+                    # If 192 -> 16 EEG channels (dual-band: 8 ERP + 8 Alpha)
+                    # If 96 -> 8 EEG channels (single-band)
+                    if v.shape[1] == 192 and not getattr(args, "dual_band", False):
+                        print("[AUTO CONFIG]: Checkpoint was trained with dual-band EEG (192 features) -> Auto-enabling --dual_band.")
+                        args.dual_band = True
+                    elif v.shape[1] == 96 and getattr(args, "dual_band", False):
+                        print("[AUTO CONFIG]: Checkpoint was trained with single-band EEG (96 features) -> Auto-disabling --dual_band.")
+                        args.dual_band = False
+                    break
+                    
+            # Inspect Audio encoder input dimension
+            for k, v in st_inspect.items():
+                if "audio_encoder.proj.0.weight" in k:
+                    # v.shape[1] is audio in_channels
+                    # If 17 -> 8 subbands + 8 onsets + 1 broadband
+                    # If 9 -> 8 subbands + 1 broadband
+                    # If 8 -> 8 subbands
+                    if v.shape[1] == 17:
+                        if not getattr(args, "include_onsets", False):
+                            print("[AUTO CONFIG]: Checkpoint was trained with acoustic onsets (17 audio channels) -> Auto-enabling --include_onsets.")
+                            args.include_onsets = True
+                        if not getattr(args, "include_broadband", True):
+                            args.include_broadband = True
+                    elif v.shape[1] == 9:
+                        if getattr(args, "include_onsets", False):
+                            print("[AUTO CONFIG]: Checkpoint was trained without onsets (9 audio channels) -> Auto-disabling --include_onsets.")
+                            args.include_onsets = False
+                        if not getattr(args, "include_broadband", True):
+                            args.include_broadband = True
+                    elif v.shape[1] == 8:
+                        if getattr(args, "include_onsets", False):
+                            args.include_onsets = False
+                        if getattr(args, "include_broadband", True):
+                            args.include_broadband = False
+                    break
+        except Exception as e:
+            print(f"[CHECKPOINT INSPECT]: Note: Could not auto-detect configuration from checkpoint ({e}). Using provided CLI flags.")
+
     # 2. Load Mapping and 8-band Envelopes
     mapping = {}
     envelopes = {}
@@ -850,9 +916,23 @@ def run_multiband_training(args):
                 st = {k[6:]: v for k, v in st.items()}
             elif not any(k.startswith("model.") for k in st.keys()) and any(k.startswith("model.") for k in model.state_dict().keys()):
                 st = {f"model.{k}": v for k, v in st.items()}
-            missing, unexpected = model.load_state_dict(st, strict=False)
+            try:
+                missing, unexpected = model.load_state_dict(st, strict=False)
+                print(f"  --> Pre-trained checkpoint loaded successfully (missing={len(missing)}, unexpected={len(unexpected)}).")
+            except RuntimeError as re:
+                print(f"[CHECKPOINT WARNING]: Direct load encountered shape discrepancy: {re}")
+                print("  --> Filtering out size-mismatched parameters to load compatible layers...")
+                model_state = model.state_dict()
+                filtered_st = {}
+                for k, v in st.items():
+                    if k in model_state:
+                        if v.shape == model_state[k].shape:
+                            filtered_st[k] = v
+                        else:
+                            print(f"      Skipping mismatched parameter {k}: ckpt {v.shape} vs model {model_state[k].shape}")
+                missing, unexpected = model.load_state_dict(filtered_st, strict=False)
+                print(f"  --> Loaded {len(filtered_st)} compatible parameters successfully.")
             best_weights = deepcopy(model.state_dict())
-            print(f"  --> Pre-trained checkpoint loaded successfully (missing={len(missing)}, unexpected={len(unexpected)}).")
         else:
             print(f"\n[WARNING]: Specified checkpoint {ckpt_candidate} not found on disk.")
 
