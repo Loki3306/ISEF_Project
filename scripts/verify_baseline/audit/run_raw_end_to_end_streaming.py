@@ -82,6 +82,110 @@ def format_attention_meter(m_score: float, width: int = 20) -> str:
         r = " " * half
     return f"[{l}|{r}]"
 
+
+class StreamingCausalMultiBandGammatoneExtractor:
+    """
+    100% Causal Streaming 8-Band Gammatone Auditory Filterbank & Envelope Extractor.
+    Processes raw continuous 44.1 kHz audio chunks (e.g. 250 ms = 11,025 samples) in real time:
+      1. 8-band Gammatone auditory IIR filterbank (cascaded SOS) with persistent state zi.
+      2. Cortical power-law compression (|x|^0.6).
+      3. Causal 8 Hz lowpass envelope smoothing (SOS).
+      4. Stateful decimation down to 64 Hz (16 samples per 250 ms tick).
+      5. Streaming acoustic onset derivative computation (Δenv = max(0, ∇env)).
+    Yields 16 channels (8 subbands + 8 onsets) at 64 Hz strictly causally with zero lookahead.
+    """
+    def __init__(
+        self,
+        audio_fs: float = 44100.0,
+        target_fs: float = 64.0,
+        num_bands: int = 8,
+        low_freq: float = 100.0,
+        high_freq: float = 7500.0,
+        power_exponent: float = 0.6
+    ):
+        self.audio_fs = float(audio_fs)
+        self.target_fs = float(target_fs)
+        self.num_bands = num_bands
+        self.power_exponent = float(power_exponent)
+        
+        # Center frequencies along Glasberg & Moore ERB scale
+        erb_low = 21.4 * np.log10(4.37 * low_freq / 1000.0 + 1.0)
+        erb_high = 21.4 * np.log10(4.37 * high_freq / 1000.0 + 1.0)
+        erb_points = np.linspace(erb_low, erb_high, num_bands)
+        self.cfs = (10.0 ** (erb_points / 21.4) - 1.0) / 4.37 * 1000.0
+        
+        # 8-band Gammatone FIR filters (numtaps=1024, ~23 ms window; unconditionally stable)
+        from scipy import signal
+        self.gt_fir: List[np.ndarray] = []
+        self.gt_zi: List[np.ndarray] = []
+        for cf in self.cfs:
+            fir = signal.gammatone(cf, 'fir', fs=self.audio_fs, numtaps=1024)[0]
+            self.gt_fir.append(fir)
+            self.gt_zi.append(np.zeros(len(fir) - 1, dtype=np.float64))
+            
+        # Envelope extraction smoothing filter: 8 Hz 2nd-order Butterworth lowpass at 44.1 kHz
+        self.lp_sos = signal.butter(2, 8.0, btype='low', fs=self.audio_fs, output='sos')
+        self.lp_zi = [np.zeros((self.lp_sos.shape[0], 2), dtype=np.float64) for _ in range(num_bands)]
+        
+        # Phase accumulator for exact decimation
+        self.decim_step = self.audio_fs / self.target_fs # 689.0625
+        self.sample_idx_accum = 0
+        self.prev_last_env = np.zeros(num_bands, dtype=np.float32)
+        self.is_first_chunk = True
+
+    def reset(self):
+        for i in range(self.num_bands):
+            self.gt_zi[i].fill(0.0)
+            self.lp_zi[i].fill(0.0)
+        self.sample_idx_accum = 0
+        self.prev_last_env.fill(0.0)
+        self.is_first_chunk = True
+
+    def process_chunk(self, raw_audio_chunk: np.ndarray, target_samples: int = 16) -> np.ndarray:
+        """
+        Processes a single incoming audio chunk (e.g. 11,025 samples at 44.1 kHz).
+        Returns: [16, target_samples] numpy array (8 subbands + 8 acoustic onsets) at 64 Hz.
+        """
+        from scipy import signal
+        audio = np.asarray(raw_audio_chunk, dtype=np.float64)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=-1)
+        audio = audio.reshape(-1)
+        n_in = len(audio)
+        
+        if n_in == 0:
+            return np.zeros((16, target_samples), dtype=np.float32)
+            
+        # Filter each of the 8 auditory bands causally using stable FIR filter with persistent state
+        band_envs = []
+        for i in range(self.num_bands):
+            filtered, self.gt_zi[i] = signal.lfilter(self.gt_fir[i], 1.0, audio, zi=self.gt_zi[i])
+            compressed = np.abs(filtered) ** self.power_exponent
+            env, self.lp_zi[i] = signal.sosfilt(self.lp_sos, compressed, zi=self.lp_zi[i])
+            band_envs.append(env)
+            
+        band_matrix = np.stack(band_envs, axis=0) # [8, n_in]
+        
+        # Causal downsampling to 64 Hz
+        sample_indices = np.clip((np.arange(target_samples) * self.decim_step).astype(int), 0, n_in - 1)
+        decimated_env = band_matrix[:, sample_indices].astype(np.float32) # [8, target_samples]
+        
+        # Streaming onset calculation across block boundary
+        if self.is_first_chunk:
+            prepend = decimated_env[:, :1]
+            self.is_first_chunk = False
+        else:
+            prepend = self.prev_last_env[:, None]
+            
+        self.prev_last_env = decimated_env[:, -1].copy()
+        
+        diff = np.diff(decimated_env, prepend=prepend, axis=-1)
+        onset = np.maximum(0.0, diff) # [8, target_samples]
+        
+        # Concatenate 8 cochlear subbands + 8 acoustic onsets -> 16 channels
+        out_16 = np.concatenate([decimated_env, onset], axis=0) # [16, target_samples]
+        return out_16
+
 # Default Constants
 FS_RAW_EEG = 512.0
 FS_MODEL = 64.0
@@ -236,16 +340,10 @@ def run_raw_end_to_end_streaming(
     else:
         raw_wav_b = raw_wav_b[:target_aud_samples]
         
-    # 3. Causal Multi-Band Gammatone Auditory Envelope Extraction (44.1 kHz -> 64 Hz, 8 bands)
-    print("  [COCHLEAR FILTERBANK]: Extracting 8-band Gammatone envelopes & acoustic onsets...")
-    env_a_8ch = extract_gammatone_envelopes(str(wav_path_a), num_bands=8, target_fs=int(FS_MODEL)) # [8, Time]
-    env_b_8ch = extract_gammatone_envelopes(str(wav_path_b), num_bands=8, target_fs=int(FS_MODEL)) # [8, Time]
-    
-    # Compute first-order acoustic onset derivative
-    onset_a = np.maximum(0.0, np.diff(env_a_8ch, prepend=env_a_8ch[:, :1], axis=-1))
-    onset_b = np.maximum(0.0, np.diff(env_b_8ch, prepend=env_b_8ch[:, :1], axis=-1))
-    audio_feat_a_16 = np.concatenate([env_a_8ch, onset_a], axis=0) # [16, Time]
-    audio_feat_b_16 = np.concatenate([env_b_8ch, onset_b], axis=0) # [16, Time]
+    # 3. Initialize Dual Real-Time Streaming Cochlear Gammatone Filterbanks (44.1 kHz -> 64 Hz, 8 bands)
+    print("  [COCHLEAR FILTERBANK]: Initializing dual streaming 8-band Gammatone filterbanks (100% causal per-tick extraction)...")
+    gamma_ext_a = StreamingCausalMultiBandGammatoneExtractor(audio_fs=FS_AUDIO, target_fs=FS_MODEL, num_bands=8, power_exponent=0.6)
+    gamma_ext_b = StreamingCausalMultiBandGammatoneExtractor(audio_fs=FS_AUDIO, target_fs=FS_MODEL, num_bands=8, power_exponent=0.6)
     
     # 4. Resolve Ground Truth Attended Talker
     cued_speaker = "A" if "female" in trial_meta.attended_speaker.lower() and "marianne" in fname_a.lower() or "male" in trial_meta.attended_speaker.lower() and "aske" in fname_a.lower() else "B"
@@ -292,8 +390,8 @@ def run_raw_end_to_end_streaming(
     
     total_ticks = min(
         len(raw_trial_eeg_512) // chunk_samples_raw_eeg,
-        audio_feat_a_16.shape[1] // chunk_samples_64_eeg,
-        len(raw_wav_a) // chunk_samples_audio
+        len(raw_wav_a) // chunk_samples_audio,
+        len(raw_wav_b) // chunk_samples_audio
     )
     
     # Ring buffers (holding 64 Hz 16-channel features)
@@ -353,11 +451,15 @@ def run_raw_end_to_end_streaming(
         erp_c, alpha_c = dual_filter.process_chunk(eeg_64_8ch)
         eeg_dual_chunk = np.concatenate([erp_c, alpha_c], axis=-1) # [16, 16]
         
-        # B. Ingest Audio Envelopes (16 channels: 8 subbands + 8 onsets)
-        s_feat = tick * chunk_samples_64_eeg
-        e_feat = s_feat + chunk_samples_64_eeg
-        ya_16_chunk = audio_feat_a_16[:, s_feat:e_feat]
-        yb_16_chunk = audio_feat_b_16[:, s_feat:e_feat]
+        # B. Ingest Raw 44.1 kHz Audio Chunks & Causally Extract Gammatones
+        s_aud = tick * chunk_samples_audio
+        e_aud = s_aud + chunk_samples_audio
+        raw_aud_a = raw_wav_a[s_aud:e_aud]
+        raw_aud_b = raw_wav_b[s_aud:e_aud]
+        
+        # Live 100% Causal Cochlear Envelope + Onset Extraction (44.1 kHz -> 64 Hz, 16 channels)
+        ya_16_chunk = gamma_ext_a.process_chunk(raw_aud_a, target_samples=chunk_samples_64_eeg)
+        yb_16_chunk = gamma_ext_b.process_chunk(raw_aud_b, target_samples=chunk_samples_64_eeg)
         
         # C. Push to Sliding Ring Buffer
         eeg_ring.append(eeg_dual_chunk)
@@ -427,11 +529,6 @@ def run_raw_end_to_end_streaming(
             cur_decision = gate_out["decision"]
             
         # F. Audio Slew-Rate DSP Steering of Raw 44.1 kHz Waveforms
-        s_aud = tick * chunk_samples_audio
-        e_aud = s_aud + chunk_samples_audio
-        raw_aud_a = raw_wav_a[s_aud:e_aud]
-        raw_aud_b = raw_wav_b[s_aud:e_aud]
-        
         target_g_a = 0.0
         target_g_b = 0.0
         if len(raw_aud_a) > 0 and len(raw_aud_b) > 0:
