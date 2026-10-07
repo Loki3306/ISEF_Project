@@ -733,6 +733,7 @@ def run_multiband_training(args):
         print(f"  COMMENCING {model_tag.upper()} TRAINING ({args.epochs} EPOCHS)")
         print("=" * 96)
     
+    epochs_no_improve = 0
     for epoch in ([] if args.eval_only else range(1, args.epochs + 1)):
         t_epoch_start = time.time()
         model.train()
@@ -830,14 +831,22 @@ def run_multiband_training(args):
             best_val_loss = avg_val_loss
             best_weights = deepcopy(model.state_dict())
             star_flag = f" [*BEST Acc: {val_acc:5.1f}%*]"
+            epochs_no_improve = 0
         else:
             star_flag = ""
+            epochs_no_improve += 1
             
         print(f"  Epoch [{epoch:02d}/{args.epochs:02d}] | Train Loss: {avg_train_loss:.4f} (Acc: {train_acc:5.1f}%) | Val Loss: {avg_val_loss:.4f} (Acc: {val_acc:5.1f}%) | LR: {scheduler.get_last_lr()[0]:.2e} | Time: {epoch_sec:.1f}s{star_flag}")
         
         if epoch % 5 == 0 or is_best or epoch == args.epochs:
             ckpt_path = resolve_output_path(args.output_model)
             torch.save(best_weights, ckpt_path)
+            
+        if args.patience > 0 and epochs_no_improve >= args.patience:
+            print(f"\n[EARLY STOPPING]: Validation accuracy plateaued for {args.patience} epochs.")
+            print(f"  --> Stopping early at Epoch {epoch} to prevent overfitting and save GPU compute.")
+            print(f"  --> Restoring best checkpoint from Epoch {epoch - epochs_no_improve} (*BEST Val Acc: {best_val_acc:.1f}%*).")
+            break
             
     # 6. Final Evaluation on Held-Out Test Split (Multi-Tier Combined Benchmark)
     print("\n" + "=" * 128)
@@ -1039,6 +1048,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-Band Cochlear Gammatone + CA-TCN Training")
     parser.add_argument("--montage", type=str, default="near_ear_expanded", choices=list(MONTAGES.keys()))
     parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--patience", type=int, default=4, help="Early stopping patience (exit if validation accuracy fails to improve for N epochs)")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=3e-2)

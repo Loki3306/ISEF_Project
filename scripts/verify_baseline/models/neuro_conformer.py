@@ -234,26 +234,30 @@ class CausalPhysiologicalCrossAttention(nn.Module):
         
         self.ffn = FeedForwardModule(d_model, ffn_dim, dropout)
         self.final_ln = nn.LayerNorm(d_model)
+        self._mask_cache: dict[tuple[int, str], torch.Tensor] = {}
         
-    def generate_latency_mask(self, T: int, device: torch.device) -> torch.Tensor:
+    def get_latency_mask(self, T: int, device: torch.device) -> torch.Tensor:
         """
-        Creates an additive attention mask of shape (T, T).
+        Retrieves or creates a cached additive attention mask of shape (T, T).
         Position (t_eeg, t_audio) is 0.0 if t_eeg - t_audio in [min_lag, max_lag], else -inf.
+        Cached by (T, device) to avoid GPU allocation/synchronization stalls in the hot loop.
         """
-        t_q = torch.arange(T, device=device).unsqueeze(1)  # (T, 1)
-        t_k = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
-        lag = t_q - t_k  # lag = t_eeg - t_audio
-        valid = (lag >= self.min_lag) & (lag <= self.max_lag)
-        mask = torch.full((T, T), float('-inf'), device=device)
-        mask[valid] = 0.0
-        # Prevent completely masked rows at boundaries
-        mask[0, 0] = 0.0
-        return mask
+        key = (T, str(device))
+        if key not in self._mask_cache or self._mask_cache[key].device != device:
+            t_q = torch.arange(T, device=device).unsqueeze(1)  # (T, 1)
+            t_k = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
+            lag = t_q - t_k  # lag = t_eeg - t_audio
+            valid = (lag >= self.min_lag) & (lag <= self.max_lag)
+            mask = torch.full((T, T), float('-inf'), device=device)
+            mask[valid] = 0.0
+            mask[0, 0] = 0.0
+            self._mask_cache[key] = mask
+        return self._mask_cache[key]
         
     def forward(self, z_eeg: torch.Tensor, z_audio: torch.Tensor) -> torch.Tensor:
         # z_eeg: (B, T, D), z_audio: (B, T, D)
         B, T, D = z_eeg.shape
-        attn_mask = self.generate_latency_mask(T, z_eeg.device)
+        attn_mask = self.get_latency_mask(T, z_eeg.device)
         
         q = self.ln_q(z_eeg)
         kv = self.ln_kv(z_audio)
