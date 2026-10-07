@@ -826,7 +826,19 @@ def run_multiband_training(args):
     best_val_loss = float('inf')
     best_weights = deepcopy(model.state_dict())
     
-    # Checkpoint pre-loading if provided
+    # Checkpoint pre-loading if provided or auto-discovered in eval_only mode
+    if not args.checkpoint_path and args.eval_only:
+        default_candidates = [
+            Path("/kaggle/working/hybrid_neuro_conformer_best.pt"),
+            Path("/kaggle/working/sinc_multiband_catcn_best.pt"),
+            Path(resolve_output_path(args.output_model))
+        ]
+        for dc in default_candidates:
+            if dc.exists():
+                args.checkpoint_path = str(dc)
+                print(f"[AUTO DISCOVERY]: Auto-detected pre-trained checkpoint: {dc}")
+                break
+
     if args.checkpoint_path:
         ckpt_candidate = Path(args.checkpoint_path)
         if ckpt_candidate.exists():
@@ -838,9 +850,9 @@ def run_multiband_training(args):
                 st = {k[6:]: v for k, v in st.items()}
             elif not any(k.startswith("model.") for k in st.keys()) and any(k.startswith("model.") for k in model.state_dict().keys()):
                 st = {f"model.{k}": v for k, v in st.items()}
-            model.load_state_dict(st, strict=True)
+            missing, unexpected = model.load_state_dict(st, strict=False)
             best_weights = deepcopy(model.state_dict())
-            print("  --> Pre-trained checkpoint loaded successfully.")
+            print(f"  --> Pre-trained checkpoint loaded successfully (missing={len(missing)}, unexpected={len(unexpected)}).")
         else:
             print(f"\n[WARNING]: Specified checkpoint {ckpt_candidate} not found on disk.")
 
@@ -1008,7 +1020,7 @@ def run_multiband_training(args):
     adapt_params = actual_eeg_channels * actual_eeg_channels
     print("\n" + "=" * 138)
     print("  GRAND COHORT BENCHMARK ON HELD-OUT TEST TRIALS (UNIFIED BEST METHODS COMBINED)")
-    print(f"  Backbone: {model_tag} | Spatial: {adapt_params}-Param Adapter ({'Deep' if getattr(args, 'deep_adapt', True) else 'Linear'}) | Gate: {gate_name}")
+    print(f"  Backbone: {model_tag} | Spatial: {adapt_params}-Param Adapter ({'Deep' if getattr(args, 'deep_adapt', False) else 'Linear'}) | Gate: {gate_name}")
     print("=" * 138)
     model.load_state_dict(best_weights)
     model.eval()
@@ -1068,7 +1080,7 @@ def run_multiband_training(args):
                 model, cal_eeg, cal_ya, cal_yb, cal_dir=cal_dir,
                 win_samples=win_5s_smp, hop_samples=int(args.hop_sec * FS), device=device,
                 epochs=args.calib_epochs, lr=args.calib_lr, deep_lr=getattr(args, "deep_adapt_lr", 5e-4),
-                l2_identity=args.l2_identity, n_channels=eeg_ch_dim, deep_adapt=getattr(args, "deep_adapt", True)
+                l2_identity=args.l2_identity, n_channels=eeg_ch_dim, deep_adapt=getattr(args, "deep_adapt", False)
             )
         else:
             adapter = SpatialEEGAdapter(channels=eeg_ch_dim).to(device)
@@ -1288,7 +1300,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_broadband", action="store_false", dest="include_broadband", help="Disable broadband envelope inclusion")
     parser.add_argument("--adapt", action="store_true", default=True, help="Enable few-shot spatial adaptation")
     parser.add_argument("--no_adapt", action="store_false", dest="adapt", help="Disable few-shot spatial adaptation")
-    parser.add_argument("--deep_adapt", action="store_true", default=True, help="Enable deep adaptation of SincNet frequency cutoffs and LayerNorms")
+    parser.add_argument("--deep_adapt", action="store_true", default=False, help="Enable deep adaptation of SincNet frequency cutoffs and LayerNorms")
     parser.add_argument("--no_deep_adapt", action="store_false", dest="deep_adapt", help="Disable deep adaptation (adapt only linear spatial matrix)")
     parser.add_argument("--deep_adapt_lr", type=float, default=5e-4, help="Learning rate for SincNet and LayerNorm parameters during deep adaptation")
     parser.add_argument("--calib_trials", type=int, default=12, help="Number of calibration trials for few-shot spatial adaptation")
@@ -1296,15 +1308,15 @@ if __name__ == "__main__":
     parser.add_argument("--calib_lr", type=float, default=1e-3, help="Learning rate for 64-parameter spatial adapter")
     parser.add_argument("--l2_identity", type=float, default=0.05, help="Frobenius identity shrinkage regularization weight")
     parser.add_argument("--gate_alpha", type=float, default=0.85, help="Exponential moving average factor for Sticky Hysteresis Gate")
-    parser.add_argument("--gate_switch", type=float, default=0.35, help="Switching margin threshold theta_switch")
-    parser.add_argument("--gate_maintain", type=float, default=0.15, help="Retention margin threshold theta_maintain")
+    parser.add_argument("--gate_switch", type=float, default=0.20, help="Switching margin threshold theta_switch (default: 0.20)")
+    parser.add_argument("--gate_maintain", type=float, default=0.08, help="Retention margin threshold theta_maintain (default: 0.08)")
     parser.add_argument("--gate_step_sec", type=float, default=0.5, help="Streaming step size in seconds (2 Hz control rate)")
     parser.add_argument("--dual_band", action="store_true", default=False, help="Extract dual-band EEG (1-6.5 Hz ERP + 8-13 Hz Alpha lateralization band)")
     parser.add_argument("--alpha_lowcut", type=float, default=8.0, help="Alpha bandpass low cutoff in Hz (default: 8.0)")
     parser.add_argument("--alpha_highcut", type=float, default=13.0, help="Alpha bandpass high cutoff in Hz (default: 13.0)")
     parser.add_argument("--include_onsets", action="store_true", default=False, help="Include 8-band acoustic half-wave rectified onset features")
-    parser.add_argument("--spatial_loss_weight", type=float, default=0.25, help="Weight for auxiliary spatial direction BCE classification loss")
-    parser.add_argument("--spatial_weight", type=float, default=0.35, help="Fusion weight for spatial direction margin during testing (delta_total = delta_env + w_spatial * delta_dir)")
+    parser.add_argument("--spatial_loss_weight", type=float, default=0.0, help="Weight for auxiliary spatial direction BCE classification loss (default: 0.0)")
+    parser.add_argument("--spatial_weight", type=float, default=0.0, help="Fusion weight for spatial direction margin during testing (default: 0.0)")
     parser.add_argument("--use_leaky_integration", action="store_true", default=True, help="Enable continuous leaky cumulative decision integration")
     parser.add_argument("--no_leaky_integration", action="store_false", dest="use_leaky_integration", help="Disable continuous leaky cumulative integration")
     parser.add_argument("--leaky_gamma", type=float, default=0.90, help="Decay factor gamma for continuous leaky cumulative decision integration (0.90 = ~3.3s half-life)")
@@ -1318,7 +1330,7 @@ if __name__ == "__main__":
     parser.add_argument("--eeg_dir", type=str, default=None)
     parser.add_argument("--audio_dir", type=str, default=None)
     parser.add_argument("--audio_env_file", type=str, default=None)
-    parser.add_argument("--arch", type=str, default="sinc", choices=["conformer", "neuroconformer", "msca", "sinc", "baseline"], help="Model architecture: 'conformer' (v4 Dual-Stream Cross-Modal Neuro-Conformer), 'msca' (v3), 'sinc' (v2), 'baseline' (v1)")
+    parser.add_argument("--arch", type=str, default="conformer", choices=["conformer", "neuroconformer", "msca", "sinc", "baseline"], help="Model architecture: 'conformer' (v4 Dual-Stream Cross-Modal Neuro-Conformer), 'msca' (v3), 'sinc' (v2), 'baseline' (v1)")
     parser.add_argument("--subsample_stride", type=int, default=2, help="Temporal subsampling stride for Conformer attention (2 = 32Hz, 4x speedup, 1 = unstrided 64Hz)")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Pre-trained checkpoint to load")
     parser.add_argument("--eval_only", action="store_true", help="Skip backbone training and execute adaptation and multi-tier benchmark directly")
