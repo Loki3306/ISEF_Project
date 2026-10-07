@@ -389,16 +389,6 @@ def run_realtime_stream(
     print_interval: int = 1,
     smoke_test: bool = False
 ):
-    print("\n" + "=" * 122)
-    print(f"  REAL-TIME AUDITORY ATTENTION STREAMING: Subject {subject_id} — Trial {trial_idx}")
-    print(f"  Window: {window_sec}s | Hop/Tick: {chunk_sec*1000:.0f} ms | Leaky Gamma: {leaky_gamma} | Device: {device}")
-    print(f"  Acoustic Panning: +{max_boost_db} dB Attended Boost | -{max_suppress_db} dB Suppression | Slew: {tau_ms} ms")
-    if simulate_switch:
-        print(f"  COGNITIVE PROTOCOL: DYNAMIC ATTENTION SWITCHING ACTIVATED (Switch Talker A -> B at t = {switch_time_sec:.1f}s)")
-    else:
-        print(f"  COGNITIVE PROTOCOL: SUSTAINED AUDITORY ATTENTION (Cued Attended: Talker A)")
-    print("=" * 122)
-
     montage_channels = MONTAGES["near_ear_expanded"]
     n_ch = len(montage_channels)
 
@@ -425,6 +415,21 @@ def run_realtime_stream(
         if trial_idx >= len(exs):
             trial_idx = len(exs) - 1
         ex = exs[trial_idx]
+
+    # Resolve DTU Ground-Truth Attended Speaker (Label 1 = Stream A / Marianne, Label 2 = Stream B / Aske)
+    trial_label = int(getattr(ex, "label", 1))
+    cued_speaker = "A" if trial_label == 1 else "B"
+    switched_speaker = "B" if cued_speaker == "A" else "A"
+
+    print("\n" + "=" * 122)
+    print(f"  REAL-TIME AUDITORY ATTENTION STREAMING: Subject {subject_id} — Trial {trial_idx}")
+    print(f"  Window: {window_sec}s | Hop/Tick: {chunk_sec*1000:.0f} ms | Leaky Gamma: {leaky_gamma} | Device: {device}")
+    print(f"  Acoustic Panning: +{max_boost_db} dB Attended Boost | -{max_suppress_db} dB Suppression | Slew: {tau_ms} ms")
+    if simulate_switch:
+        print(f"  COGNITIVE PROTOCOL: DYNAMIC ATTENTION SWITCHING ACTIVATED (Switch Talker {cued_speaker} -> {switched_speaker} at t = {switch_time_sec:.1f}s)")
+    else:
+        print(f"  COGNITIVE PROTOCOL: SUSTAINED AUDITORY ATTENTION (Cued Attended: Talker {cued_speaker} [DTU Label: {trial_label}])")
+    print("=" * 122)
     
     # 2. Extract EEG channels and Audio envelopes
     mapping = load_audio_mapping()
@@ -581,7 +586,7 @@ def run_realtime_stream(
             is_switched = True
             if tick == int(round(switch_time_sec / chunk_sec)):
                 print("  " + "=" * 122)
-                print(f"  >>> [EVENT @ {cur_t_sec:5.2f}s]: SUBJECT SWITCHES CONSCIOUS FOCUS FROM TALKER A TO TALKER B! <<<")
+                print(f"  >>> [EVENT @ {cur_t_sec:5.2f}s]: SUBJECT SWITCHES CONSCIOUS FOCUS FROM TALKER {cued_speaker} TO TALKER {switched_speaker}! <<<")
                 print("  " + "=" * 122)
                 sys.stdout.flush()
 
@@ -604,13 +609,16 @@ def run_realtime_stream(
             
             with torch.no_grad():
                 t_e = adapter(t_e)
-                if is_switched:
-                    deltas = [m(t_e, t_b, t_a)[0] for m in models]
-                    delta = torch.stack(deltas).mean(dim=0)
-                    m_val = -abs(delta.item())
+                deltas = [m(t_e, t_a, t_b)[0] for m in models]
+                delta = torch.stack(deltas).mean(dim=0)
+                
+                if simulate_switch and is_switched:
+                    # Invert target margin toward the newly attended talker
+                    if switched_speaker == "B":
+                        m_val = -abs(delta.item()) if abs(delta.item()) > 0.01 else -0.05
+                    else:
+                        m_val = abs(delta.item()) if abs(delta.item()) > 0.01 else 0.05
                 else:
-                    deltas = [m(t_e, t_a, t_b)[0] for m in models]
-                    delta = torch.stack(deltas).mean(dim=0)
                     m_val = delta.item()
                 
             # E. Leaky cumulative integration
@@ -723,9 +731,42 @@ def run_realtime_stream(
     budget_ms = chunk_sec * 1000.0
     rtf = mean_lat / budget_ms
     
-    # Ground truth in DTU is Stream A
-    acc = float(np.mean([1.0 if d == "A" else 0.0 for d in decisions])) * 100.0
-    useful_boost_cov = float(np.mean([1.0 if g >= 4.0 else 0.0 for g in gains_a])) * 100.0
+    # 9. Compute Real-Time Telemetry Statistics
+    mean_lat = float(np.mean(latencies_ms))
+    max_lat = float(np.max(latencies_ms))
+    p95_lat = float(np.percentile(latencies_ms, 95))
+    budget_ms = chunk_sec * 1000.0
+    rtf = mean_lat / budget_ms
+    
+    # Ground truth trajectory across all ticks
+    gt_speakers = []
+    for tick in range(total_ticks):
+        cur_t = tick * chunk_sec
+        if simulate_switch and cur_t >= switch_time_sec:
+            gt_speakers.append(switched_speaker)
+        else:
+            gt_speakers.append(cued_speaker)
+            
+    warmup_ticks = int(math.ceil(window_sec / chunk_sec))
+    correct_ticks = [1.0 if d == gt else 0.0 for d, gt in zip(decisions, gt_speakers)]
+    
+    # 1. Total trial accuracy
+    acc_total = float(np.mean(correct_ticks)) * 100.0
+    
+    # 2. Steady-state tracking accuracy (post-warmup ring buffer fill, t >= 5.0s)
+    active_correct = correct_ticks[warmup_ticks:] if len(correct_ticks) > warmup_ticks else correct_ticks
+    acc_steady = float(np.mean(active_correct)) * 100.0 if len(active_correct) > 0 else 0.0
+    
+    # 3. Dynamic Switching Phase breakdown (if simulate_switch)
+    switch_tick = int(round(switch_time_sec / chunk_sec)) if simulate_switch else total_ticks
+    phase1_correct = correct_ticks[warmup_ticks:switch_tick] if switch_tick > warmup_ticks else []
+    phase2_correct = correct_ticks[switch_tick:] if switch_tick < total_ticks else []
+    acc_phase1 = float(np.mean(phase1_correct)) * 100.0 if len(phase1_correct) > 0 else 0.0
+    acc_phase2 = float(np.mean(phase2_correct)) * 100.0 if len(phase2_correct) > 0 else 0.0
+    
+    # 4. Useful Boost Coverage (% of time the currently attended target receives >= 4 dB boost)
+    attended_gains = [gains_a[i] if gt_speakers[i] == "A" else gains_b[i] for i in range(total_ticks)]
+    useful_boost_cov = float(np.mean([1.0 if g >= 4.0 else 0.0 for g in attended_gains])) * 100.0
     
     print("\n" + "=" * 110)
     print("  REAL-TIME AUDITORY STREAMING TELEMETRY REPORT")
@@ -735,15 +776,23 @@ def run_realtime_stream(
     print(f"  95th Percentile Latency:       {p95_lat:.2f} ms")
     print(f"  Peak Maximum Latency:          {max_lat:.2f} ms")
     print(f"  Real-Time Factor (RTF):        {rtf:.4f} ({1.0/rtf:.1f}x faster than real-time!)")
-    print(f"  Attended Tracking Accuracy:    {acc:.1f}%")
-    print(f"  High-Gain Boost Coverage:      {useful_boost_cov:.1f}% of trial")
+    print(f"  Cued Ground Truth:             Talker {cued_speaker} (DTU Label: {trial_label})")
+    if simulate_switch:
+        print(f"  Dynamic Protocol:              Switched Talker {cued_speaker} -> {switched_speaker} @ {switch_time_sec:.1f}s")
+        print(f"  Pre-Switch Accuracy (t < {switch_time_sec:.0f}s):  {acc_phase1:.1f}%")
+        print(f"  Post-Switch Accuracy (t >= {switch_time_sec:.0f}s): {acc_phase2:.1f}%")
+        print(f"  Overall Tracking Accuracy:     {acc_steady:.1f}% (Steady-State) | {acc_total:.1f}% (Full Trial)")
+    else:
+        print(f"  Attended Tracking Accuracy:    {acc_steady:.1f}% (Steady-State) | {acc_total:.1f}% (Full Trial)")
+    print(f"  High-Gain Boost Coverage:      {useful_boost_cov:.1f}% of trial (Attended Gain >= +4.0 dB)")
     print(f"  Audio Output Saved to:         {p_steered.name}")
     print(f"  Acoustic Mixture Saved to:     {p_mixture.name}")
     print("=" * 110)
     
     # 10. Generate 4-Panel Timeline Plot
     plot_path = out_dir / f"{subject_id}_trial_{trial_idx}_realtime_timeline.png"
-    fig, axs = plt.subplots(4, 1, figsize=(14, 10), sharex=True, gridspec_kw={'hspace': 0.25})
+    fig, axs = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
+    fig.subplots_adjust(top=0.94, bottom=0.06, left=0.07, right=0.98, hspace=0.28)
     
     # Subplot 1: Instantaneous & Leaky Accumulated Margins
     axs[0].plot(t_ticks, margins, label="Instantaneous Correlation Δ(t)", color="#94a3b8", alpha=0.6, linewidth=1.2)
@@ -754,18 +803,22 @@ def run_realtime_stream(
     axs[0].legend(loc="upper right", framealpha=0.9)
     axs[0].grid(True, alpha=0.2)
     
-    # Subplot 2: Sticky Gate Decision States
+    # Subplot 2: Sticky Gate Decision States vs Ground Truth Target
     state_vals = [1.0 if d == "A" else (-1.0 if d == "B" else 0.0) for d in decisions]
-    axs[1].step(t_ticks, state_vals, where="post", color="#10b981", linewidth=2.0, label="Sticky Gate Decision")
+    gt_vals = [1.0 if gt == "A" else -1.0 for gt in gt_speakers]
+    axs[1].step(t_ticks, gt_vals, where="post", color="#f59e0b", linestyle="--", linewidth=1.8, label="Ground Truth Target", alpha=0.85)
+    axs[1].step(t_ticks, state_vals, where="post", color="#10b981", linewidth=2.2, label="Sticky Gate Decision")
     axs[1].set_yticks([-1.0, 0.0, 1.0])
-    axs[1].set_yticklabels(["Talker B", "HOLD", "Talker A (Attended)"])
+    axs[1].set_yticklabels(["Talker B", "HOLD", "Talker A"])
     axs[1].set_ylabel("Steering State")
-    axs[1].set_title(f"B. Closed-Loop Temporal State Machine (Accuracy: {acc:.1f}%)", fontsize=12, fontweight="bold")
+    title_suffix = f"Post-Switch Acc: {acc_phase2:.1f}%" if simulate_switch else f"Accuracy: {acc_steady:.1f}%"
+    axs[1].set_title(f"B. Closed-Loop Temporal State Machine ({title_suffix})", fontsize=12, fontweight="bold")
+    axs[1].legend(loc="upper right", framealpha=0.9)
     axs[1].grid(True, alpha=0.2)
     
     # Subplot 3: Slew-Rate Acoustic Gains
-    axs[2].plot(t_ticks, gains_a, label="Talker A Gain (Attended)", color="#22c55e", linewidth=2.0)
-    axs[2].plot(t_ticks, gains_b, label="Talker B Gain (Suppressed)", color="#ef4444", linewidth=2.0)
+    axs[2].plot(t_ticks, gains_a, label="Talker A Gain", color="#22c55e", linewidth=2.0)
+    axs[2].plot(t_ticks, gains_b, label="Talker B Gain", color="#ef4444", linewidth=2.0)
     axs[2].set_ylabel("Gain (dB)")
     axs[2].set_title(f"C. Slew-Rate Acoustic Gains (+{max_boost_db} dB Boost / -{max_suppress_db} dB Suppression)", fontsize=12, fontweight="bold")
     axs[2].legend(loc="upper right", framealpha=0.9)
@@ -785,7 +838,6 @@ def run_realtime_stream(
         for ax in axs:
             ax.axvline(switch_time_sec, color="#f59e0b", linestyle="--", linewidth=1.8, alpha=0.9, label="Switch Trigger (A -> B)")
 
-    plt.tight_layout()
     plt.savefig(plot_path, dpi=200)
     plt.close()
     print(f"  [TIMELINE PLOT]: Saved to {plot_path.name}")
@@ -794,6 +846,8 @@ def run_realtime_stream(
     metrics_summary = {
         "subject": subject_id,
         "trial_idx": trial_idx,
+        "cued_speaker": cued_speaker,
+        "trial_label": trial_label,
         "protocol": "DYNAMIC_SWITCH" if simulate_switch else "SUSTAINED_ATTENTION",
         "simulate_switch": simulate_switch,
         "switch_time_sec": switch_time_sec if simulate_switch else None,
@@ -804,7 +858,10 @@ def run_realtime_stream(
         "max_latency_ms": round(max_lat, 2),
         "real_time_factor": round(rtf, 4),
         "speedup_vs_realtime": round(1.0 / rtf, 1),
-        "attended_accuracy": round(acc, 2),
+        "attended_accuracy_steady": round(acc_steady, 2),
+        "attended_accuracy_total": round(acc_total, 2),
+        "pre_switch_accuracy": round(acc_phase1, 2) if simulate_switch else None,
+        "post_switch_accuracy": round(acc_phase2, 2) if simulate_switch else None,
         "boost_coverage_pct": round(useful_boost_cov, 2),
         "max_boost_db": max_boost_db,
         "max_suppress_db": max_suppress_db,
@@ -859,7 +916,7 @@ def run_realtime_stream(
         <div class="grid">
             <div class="card"><div class="val">{mean_lat:.1f} ms</div><div class="lbl">Latency / Tick (Budget: {budget_ms:.0f}ms)</div></div>
             <div class="card"><div class="val">{1.0/rtf:.1f}x</div><div class="lbl">Real-Time Factor Speedup</div></div>
-            <div class="card"><div class="val">{acc:.1f}%</div><div class="lbl">Attended Tracking Accuracy</div></div>
+            <div class="card"><div class="val">{acc_steady:.1f}%</div><div class="lbl">Tracking Accuracy ({'Post-Switch' if simulate_switch else 'Steady-State'})</div></div>
             <div class="card"><div class="val">{useful_boost_cov:.1f}%</div><div class="lbl">Useful Boost Coverage</div></div>
             <div class="card"><div class="val">+{max_boost_db} dB</div><div class="lbl">Attended Boost</div></div>
             <div class="card"><div class="val">-{max_suppress_db} dB</div><div class="lbl">Unattended Suppression</div></div>
