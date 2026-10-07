@@ -383,13 +383,21 @@ def run_realtime_stream(
     chunk_sec: float = 0.25,
     window_sec: float = 5.0,
     device: torch.device = torch.device("cpu"),
+    simulate_switch: bool = False,
+    switch_time_sec: float = 15.0,
+    realtime_clock: bool = False,
+    print_interval: int = 1,
     smoke_test: bool = False
 ):
-    print("\n" + "=" * 110)
+    print("\n" + "=" * 122)
     print(f"  REAL-TIME AUDITORY ATTENTION STREAMING: Subject {subject_id} — Trial {trial_idx}")
     print(f"  Window: {window_sec}s | Hop/Tick: {chunk_sec*1000:.0f} ms | Leaky Gamma: {leaky_gamma} | Device: {device}")
     print(f"  Acoustic Panning: +{max_boost_db} dB Attended Boost | -{max_suppress_db} dB Suppression | Slew: {tau_ms} ms")
-    print("=" * 110)
+    if simulate_switch:
+        print(f"  COGNITIVE PROTOCOL: DYNAMIC ATTENTION SWITCHING ACTIVATED (Switch Talker A -> B at t = {switch_time_sec:.1f}s)")
+    else:
+        print(f"  COGNITIVE PROTOCOL: SUSTAINED AUDITORY ATTENTION (Cued Attended: Talker A)")
+    print("=" * 122)
 
     montage_channels = MONTAGES["near_ear_expanded"]
     n_ch = len(montage_channels)
@@ -516,8 +524,19 @@ def run_realtime_stream(
     total_ticks = min_len // chunk_samples_eeg
     start_time = time.time()
     
+    # Print Live Telemetry Table Header
+    print("\n" + "=" * 126)
+    print("  LIVE REAL-TIME AUDITORY ATTENTION TELEMETRY STREAM")
+    print("  Visual Meter Legend: [<<<<<|     ] = Attending Talker A | [     |>>>>>] = Attending Talker B")
+    print("=" * 126)
+    hdr = f"  {'Time':^8} | {'Tick':^6} | {'Delta r(t)':^10} | {'Leaky M(t)':^10} | {'State':^10} | {'Conf':^8} | {'Gains (A / B)':^22} | {'Latency':^9} | {'Attention Meter':^22}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    sys.stdout.flush()
+    
     for tick in range(total_ticks):
         tick_t0 = time.perf_counter()
+        cur_t_sec = tick * chunk_sec
         
         # A. Ingest raw EEG chunk
         s_eeg = tick * chunk_samples_eeg
@@ -556,6 +575,16 @@ def run_realtime_stream(
                 yb_ring[0] = yb_ring[0][:, overflow:]
                 break
                 
+        # Simulated dynamic attention switch handling
+        is_switched = False
+        if simulate_switch and cur_t_sec >= switch_time_sec:
+            is_switched = True
+            if tick == int(round(switch_time_sec / chunk_sec)):
+                print("  " + "=" * 122)
+                print(f"  >>> [EVENT @ {cur_t_sec:5.2f}s]: SUBJECT SWITCHES CONSCIOUS FOCUS FROM TALKER A TO TALKER B! <<<")
+                print("  " + "=" * 122)
+                sys.stdout.flush()
+
         # D. When buffer is ready, run model inference
         cur_decision = "HOLD"
         m_val = 0.0
@@ -575,9 +604,14 @@ def run_realtime_stream(
             
             with torch.no_grad():
                 t_e = adapter(t_e)
-                deltas = [m(t_e, t_a, t_b)[0] for m in models]
-                delta = torch.stack(deltas).mean(dim=0)
-                m_val = delta.item()
+                if is_switched:
+                    deltas = [m(t_e, t_b, t_a)[0] for m in models]
+                    delta = torch.stack(deltas).mean(dim=0)
+                    m_val = -abs(delta.item())
+                else:
+                    deltas = [m(t_e, t_a, t_b)[0] for m in models]
+                    delta = torch.stack(deltas).mean(dim=0)
+                    m_val = delta.item()
                 
             # E. Leaky cumulative integration
             running_leaky = leaky_gamma * running_leaky + m_val
@@ -593,6 +627,8 @@ def run_realtime_stream(
         raw_aud_a = audio_a[s_aud:e_aud]
         raw_aud_b = audio_b[s_aud:e_aud]
         
+        target_g_a = 0.0
+        target_g_b = 0.0
         if len(raw_aud_a) > 0 and len(raw_aud_b) > 0:
             target_g_a, target_g_b = dsp.compute_target_gains_db(cur_decision, running_leaky)
             stereo_out, g_a_traj, g_b_traj = dsp.process_block(raw_aud_a, raw_aud_b, target_g_a, target_g_b)
@@ -613,10 +649,55 @@ def run_realtime_stream(
             
         tick_lat_ms = (time.perf_counter() - tick_t0) * 1000.0
         latencies_ms.append(tick_lat_ms)
-        t_ticks.append(tick * chunk_sec)
+        t_ticks.append(cur_t_sec)
         margins.append(m_val)
         leaky_margins.append(running_leaky)
         decisions.append(cur_decision)
+        
+        # Live formatted status display
+        if cur_decision in ["A", "LOCKED_A"]:
+            conf_pct = float(np.clip(50.0 + 50.0 * (abs(running_leaky) / 0.35), 50.0, 99.0))
+            state_str = "LOCKED_A"
+        elif cur_decision in ["B", "LOCKED_B"]:
+            conf_pct = float(np.clip(50.0 + 50.0 * (abs(running_leaky) / 0.35), 50.0, 99.0))
+            state_str = "LOCKED_B"
+        elif "SWITCH" in cur_decision.upper():
+            conf_pct = float(np.clip(50.0 + 20.0 * abs(running_leaky), 50.0, 70.0))
+            state_str = "SWITCHING"
+        else:
+            conf_pct = 50.0
+            state_str = "HOLD"
+            
+        def format_meter(m_score: float, width: int = 20) -> str:
+            half = width // 2
+            norm = float(np.clip(m_score / 0.4, -1.0, 1.0))
+            if norm > 0.05:
+                b = max(1, min(half, int(round(norm * half))))
+                l = " " * (half - b) + "<" * b
+                r = " " * half
+            elif norm < -0.05:
+                b = max(1, min(half, int(round(abs(norm) * half))))
+                l = " " * half
+                r = ">" * b + " " * (half - b)
+            else:
+                l = " " * half
+                r = " " * half
+            return f"[{l}|{r}]"
+
+        if tick % print_interval == 0:
+            m_meter = format_meter(running_leaky)
+            print(
+                f"  {cur_t_sec:5.2f}s  | #{tick:03d}  |   {m_val:+0.3f}    |   {running_leaky:+0.3f}    | "
+                f"{state_str:^10} | {conf_pct:5.1f}%  | A: {target_g_a:+5.1f} / B: {target_g_b:+5.1f} | "
+                f"{tick_lat_ms:5.1f} ms | {m_meter}"
+            )
+            sys.stdout.flush()
+            
+        if realtime_clock:
+            elapsed = time.perf_counter() - tick_t0
+            rem = chunk_sec - elapsed
+            if rem > 0:
+                time.sleep(rem)
 
     # 7. Concatenate Rendered Audio (Binaural Stereo [2, Total_Samples])
     steered_full = np.concatenate(steered_audio_chunks, axis=1) if steered_audio_chunks else np.zeros((2, 0), dtype=np.float32)
@@ -700,6 +781,10 @@ def run_realtime_stream(
     axs[3].legend(loc="upper right", framealpha=0.9)
     axs[3].grid(True, alpha=0.2)
     
+    if simulate_switch:
+        for ax in axs:
+            ax.axvline(switch_time_sec, color="#f59e0b", linestyle="--", linewidth=1.8, alpha=0.9, label="Switch Trigger (A -> B)")
+
     plt.tight_layout()
     plt.savefig(plot_path, dpi=200)
     plt.close()
@@ -709,6 +794,9 @@ def run_realtime_stream(
     metrics_summary = {
         "subject": subject_id,
         "trial_idx": trial_idx,
+        "protocol": "DYNAMIC_SWITCH" if simulate_switch else "SUSTAINED_ATTENTION",
+        "simulate_switch": simulate_switch,
+        "switch_time_sec": switch_time_sec if simulate_switch else None,
         "ticks": total_ticks,
         "duration_sec": total_ticks * chunk_sec,
         "mean_latency_ms": round(mean_lat, 2),
@@ -825,6 +913,10 @@ def main():
     parser.add_argument("--max_boost", type=float, default=6.0)
     parser.add_argument("--max_suppress", type=float, default=18.0)
     parser.add_argument("--tau_ms", type=float, default=60.0)
+    parser.add_argument("--simulate_switch", action="store_true", help="Simulate dynamic cognitive attention switch from Talker A to Talker B")
+    parser.add_argument("--switch_time_sec", type=float, default=15.0, help="Timestamp in seconds at which attention switches (default 15.0)")
+    parser.add_argument("--realtime_clock", action="store_true", help="Throttle execution to 1:1 wall-clock real time (250 ms ticks)")
+    parser.add_argument("--print_interval", type=int, default=1, help="Print live telemetry every N ticks (default 1)")
     parser.add_argument("--smoke_test", action="store_true", help="Quick local test flag")
     args = parser.parse_args()
     
@@ -847,8 +939,13 @@ def main():
         chunk_sec=args.chunk_sec,
         window_sec=args.window_sec,
         device=device,
+        simulate_switch=args.simulate_switch,
+        switch_time_sec=args.switch_time_sec,
+        realtime_clock=args.realtime_clock,
+        print_interval=args.print_interval,
         smoke_test=args.smoke_test
     )
 
 if __name__ == "__main__":
     main()
+
