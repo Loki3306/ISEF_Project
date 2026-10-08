@@ -68,7 +68,12 @@ def run_s1_full_cohort_audit(
     out_dir: Path,
     max_trials: Optional[int] = None,
     specific_trials: Optional[List[int]] = None,
-    device: torch.device = torch.device("cpu")
+    device: torch.device = torch.device("cpu"),
+    spatial_weight: float = 0.35,
+    gate_switch: float = 0.12,
+    gate_maintain: float = 0.05,
+    fallback_leaky: bool = True,
+    leaky_gamma: float = 0.95
 ) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     
@@ -76,6 +81,7 @@ def run_s1_full_cohort_audit(
     print("  FULL COHORT AUDIT: SUBJECT S1 END-TO-END REAL-TIME STREAMING SUITE")
     print(f"  Mode: 100% Causal Streaming (Raw 512 Hz EEG + Raw 44.1 kHz WAV Audio)")
     print(f"  Hop/Tick: {CHUNK_SEC*1000:.0f} ms | Window: {WINDOW_SEC:.1f} s | Device: {device}")
+    print(f"  Spatial Head Weight: {spatial_weight:.2f} | Gate: switch={gate_switch:.2f}, maintain={gate_maintain:.2f} | Leaky Fallback: {fallback_leaky}")
     print("=" * 120)
     
     # 1. Ingest Raw Continuous BioSemi EEG
@@ -83,6 +89,25 @@ def run_s1_full_cohort_audit(
     t_load_eeg = time.time()
     raw_data: RawDTUSubjectData = load_raw_dtu_file(raw_eeg_path)
     print(f"      Loaded in {time.time() - t_load_eeg:.2f}s | Sample Rate = {raw_data.fs:.0f} Hz | Total Trials = {len(raw_data.trials)}")
+    
+    # Look for S1_data_preproc.mat to get trial spatial direction labels (1=Left, 2=Right)
+    preproc_labels = {}
+    preproc_candidates = [
+        raw_eeg_path.parent / f"{raw_eeg_path.stem}_data_preproc.mat",
+        raw_eeg_path.parent / "S1_data_preproc.mat",
+        Path(r"C:\Users\lokes\Downloads\S1_data_preproc.mat"),
+        Path("/kaggle/input/dataset-eeg/S1_data_preproc.mat"),
+    ]
+    for pc in preproc_candidates:
+        if pc.exists():
+            try:
+                p_mat = loadmat(pc, squeeze_me=False, struct_as_record=False)
+                ev = p_mat['data'][0, 0].event[0, 0].eeg
+                preproc_labels = {i: int(ev[0, i].value[0, 0].flat[0]) for i in range(ev.shape[1])}
+                print(f"      Loaded {len(preproc_labels)} spatial trial direction labels from {pc.name}")
+                break
+            except Exception:
+                pass
     
     # 2. Load Neural Ensemble (100% Strict Trained Weights)
     print(f"\n[2/4] Loading NeuroConformer-v4 3-member ensemble from {checkpoints_dir.name}...")
@@ -167,6 +192,10 @@ def run_s1_full_cohort_audit(
         raw_trial_veog_512 = raw_data.veog_raw[s_start:s_end]
         raw_trial_heog_512 = raw_data.heog_raw[s_start:s_end]
         
+        # Determine pos_A (+1 for Left, -1 for Right) from DTU spatial labels
+        cur_lbl = preproc_labels.get(t_idx, 1)
+        pos_A = 1.0 if cur_lbl == 1 else -1.0
+        
         # Initialize Causal Processors
         raw_preprocessor = StreamingCausalRawEEGPreprocessor(
             raw_fs=FS_RAW_EEG,
@@ -183,7 +212,7 @@ def run_s1_full_cohort_audit(
         dual_filter = DualBandCausalEEGFilter(fs=FS_MODEL)
         gamma_ext_a = StreamingCausalMultiBandGammatoneExtractor(audio_fs=FS_AUDIO, target_fs=FS_MODEL, num_bands=8, power_exponent=0.6)
         gamma_ext_b = StreamingCausalMultiBandGammatoneExtractor(audio_fs=FS_AUDIO, target_fs=FS_MODEL, num_bands=8, power_exponent=0.6)
-        gate = StickyHysteresisGate(alpha=0.85, threshold_switch=0.20, threshold_maintain=0.08, n_confirm=2)
+        gate = StickyHysteresisGate(alpha=0.85, threshold_switch=gate_switch, threshold_maintain=gate_maintain, n_confirm=2)
         sq_monitor = SignalQualityMonitor()
         dsp = AudioSteeringDSP(fs=FS_AUDIO, max_boost_db=6.0, max_suppress_db=18.0, tau_ms=60.0)
         
@@ -262,14 +291,23 @@ def run_s1_full_cohort_audit(
                 t_b = torch.from_numpy(w_b_std).unsqueeze(0).float().to(device)
                 
                 with torch.no_grad():
-                    deltas = [m(t_e, t_a, t_b)[0] for m in models]
+                    deltas = []
+                    for m in models:
+                        res = m(t_e, t_a, t_b, return_spatial=True)
+                        d = res[0]
+                        s_dir = res[3]
+                        if spatial_weight > 0.0:
+                            d = d + spatial_weight * (pos_A * s_dir)
+                        deltas.append(d)
                     delta = torch.stack(deltas).mean(dim=0)
                     m_val = delta.item()
                     
-                running_leaky = 0.95 * running_leaky + m_val
+                running_leaky = leaky_gamma * running_leaky + m_val
                 sq = sq_monitor.check_eeg_window(w_e_std)
                 gate_out = gate.update(running_leaky, is_artifact=not sq["is_valid"])
                 cur_decision = gate_out["decision"]
+                if fallback_leaky and cur_decision == "HOLD":
+                    cur_decision = "A" if running_leaky >= 0.0 else "B"
                 
             # DSP Gain calculation
             tg_a, tg_b = dsp.compute_target_gains_db(cur_decision, running_leaky)
@@ -496,6 +534,11 @@ def main():
     parser.add_argument("--out_dir", type=str, default=str(REPO_ROOT / "demo_artifacts"))
     parser.add_argument("--max_trials", type=int, default=None, help="Maximum number of trials to evaluate (default: all)")
     parser.add_argument("--trials", type=int, nargs="+", default=None, help="Specific trial indices to evaluate (e.g. --trials 50 55 30 7)")
+    parser.add_argument("--spatial_weight", type=float, default=0.35, help="Spatial direction head fusion weight")
+    parser.add_argument("--gate_switch", type=float, default=0.10, help="Hysteresis gate switch threshold (calibrated for S1 SNR)")
+    parser.add_argument("--gate_maintain", type=float, default=0.04, help="Hysteresis gate maintain threshold")
+    parser.add_argument("--no_fallback_leaky", action="store_true", help="Disable continuous leaky sign fallback in HOLD deadband")
+    parser.add_argument("--leaky_gamma", type=float, default=0.95, help="Exponential leaky memory discount factor")
     parser.add_argument("--device", type=str, default="cpu")
     
     args = parser.parse_args()
@@ -508,7 +551,12 @@ def main():
         out_dir=Path(args.out_dir),
         max_trials=args.max_trials,
         specific_trials=args.trials,
-        device=dev
+        device=dev,
+        spatial_weight=args.spatial_weight,
+        gate_switch=args.gate_switch,
+        gate_maintain=args.gate_maintain,
+        fallback_leaky=not args.no_fallback_leaky,
+        leaky_gamma=args.leaky_gamma
     )
 
 

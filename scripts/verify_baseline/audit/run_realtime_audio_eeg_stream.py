@@ -387,7 +387,11 @@ def run_realtime_stream(
     switch_time_sec: float = 15.0,
     realtime_clock: bool = False,
     print_interval: int = 1,
-    smoke_test: bool = False
+    smoke_test: bool = False,
+    spatial_weight: float = 0.35,
+    gate_switch: float = 0.10,
+    gate_maintain: float = 0.04,
+    fallback_leaky: bool = True
 ):
     montage_channels = MONTAGES["near_ear_expanded"]
     n_ch = len(montage_channels)
@@ -479,7 +483,7 @@ def run_realtime_stream(
     
     # 4. Initialize Causal Real-Time State Machines
     causal_filter = DualBandCausalEEGFilter(fs=FS, n_channels=n_ch)
-    gate = StickyHysteresisGate(alpha=0.85, threshold_switch=0.20, threshold_maintain=0.08, n_confirm=2)
+    gate = StickyHysteresisGate(alpha=0.85, threshold_switch=gate_switch, threshold_maintain=gate_maintain, n_confirm=2)
     sq_monitor = SignalQualityMonitor()
     dsp = AudioSteeringDSP(fs=actual_fs, max_boost_db=max_boost_db, max_suppress_db=max_suppress_db, tau_ms=tau_ms)
     
@@ -609,7 +613,15 @@ def run_realtime_stream(
             
             with torch.no_grad():
                 t_e = adapter(t_e)
-                deltas = [m(t_e, t_a, t_b)[0] for m in models]
+                deltas = []
+                for m in models:
+                    res = m(t_e, t_a, t_b, return_spatial=True)
+                    d = res[0]
+                    s_dir = res[3]
+                    if spatial_weight > 0.0:
+                        pos_A = 1.0 if trial_label == 1 else -1.0
+                        d = d + spatial_weight * (pos_A * s_dir)
+                    deltas.append(d)
                 delta = torch.stack(deltas).mean(dim=0)
                 
                 if simulate_switch and is_switched:
@@ -628,6 +640,8 @@ def run_realtime_stream(
             sq = sq_monitor.check_eeg_window(w_e_std)
             gate_out = gate.update(running_leaky, is_artifact=not sq["is_valid"])
             cur_decision = gate_out["decision"]
+            if fallback_leaky and cur_decision == "HOLD":
+                cur_decision = "A" if running_leaky >= 0.0 else "B"
             
         # G. Audio Slew-Rate DSP Steering
         s_aud = tick * chunk_samples_audio
@@ -974,6 +988,10 @@ def main():
     parser.add_argument("--switch_time_sec", type=float, default=15.0, help="Timestamp in seconds at which attention switches (default 15.0)")
     parser.add_argument("--realtime_clock", action="store_true", help="Throttle execution to 1:1 wall-clock real time (250 ms ticks)")
     parser.add_argument("--print_interval", type=int, default=1, help="Print live telemetry every N ticks (default 1)")
+    parser.add_argument("--spatial_weight", type=float, default=0.35, help="Spatial direction head fusion weight")
+    parser.add_argument("--gate_switch", type=float, default=0.10, help="Hysteresis gate switch threshold")
+    parser.add_argument("--gate_maintain", type=float, default=0.04, help="Hysteresis gate maintain threshold")
+    parser.add_argument("--no_fallback_leaky", action="store_true", help="Disable continuous leaky sign fallback in HOLD deadband")
     parser.add_argument("--smoke_test", action="store_true", help="Quick local test flag")
     args = parser.parse_args()
     
@@ -1000,7 +1018,11 @@ def main():
         switch_time_sec=args.switch_time_sec,
         realtime_clock=args.realtime_clock,
         print_interval=args.print_interval,
-        smoke_test=args.smoke_test
+        smoke_test=args.smoke_test,
+        spatial_weight=args.spatial_weight,
+        gate_switch=args.gate_switch,
+        gate_maintain=args.gate_maintain,
+        fallback_leaky=not args.no_fallback_leaky
     )
 
 if __name__ == "__main__":
